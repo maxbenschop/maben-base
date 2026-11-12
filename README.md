@@ -2,7 +2,7 @@
 
 A free database client for the Mac, for 14 engines (below). Connections on the left, your tables in tabs, every row editable and nothing written until you save. No tab or window limits, no licence key, no account, no telemetry.
 
-Part of [Maben](https://maben.gg). Website: [base.maben.gg](https://base.maben.gg). Product colour: Base pink `#FF5CA8` with a black mark.
+Part of [Maben](https://maben.gg). Website and download: [base.maben.gg](https://base.maben.gg) (generator in `../maben/base-site-src/`), or the [latest release](https://github.com/maxbenschop/maben-base/releases/latest). It updates itself after that. Product colour: Base pink `#FF5CA8` with a black mark.
 
 Bug reports and ideas are welcome as [issues](https://github.com/maxbenschop/maben-base/issues); `CONTRIBUTING.md` explains how to send a change and what a pull request needs.
 
