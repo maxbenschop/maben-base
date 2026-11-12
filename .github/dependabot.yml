@@ -1,0 +1,7 @@
+# Keeps the actions in CI up to date. The app itself has no dependencies.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

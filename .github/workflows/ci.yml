@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build and test
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (debug)
+        run: swift build
+      - name: Build (release)
+        run: swift build -c release
+      - name: Tests (the ones against real servers are skipped here)
+        run: swift test
+      - name: Command-line tool runs SQL through the SQLite driver
+        run: |
+          db=$(mktemp -d)/ci.sqlite
+          sqlite3 "$db" "create table t (id integer primary key, name text); insert into t (name) values ('one'), ('two');"
+          .build/debug/BaseTool query "sqlite://$db" "insert into t (name) values ('three')"
+          .build/debug/BaseTool query "sqlite://$db" "select name from t order by id" | grep -qx three
+          .build/debug/BaseTool schema "sqlite://$db" | grep -qx "table t"
+      - name: Scripts parse
+        run: |
+          zsh -n release.sh
+          sh -n build.sh
+      - name: Version has a changelog entry
+        run: |
+          VERSION=$(plutil -extract CFBundleShortVersionString raw Info.plist)
+          grep -q "^## $VERSION " CHANGELOG.md || { echo "::error::CHANGELOG.md has no section for $VERSION"; exit 1; }

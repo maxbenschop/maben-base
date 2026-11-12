@@ -1,0 +1,37 @@
+name: Bug report
+description: Something doesn't work as it should
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+      description: If Base wrote something you didn't save, or showed a value wrongly, name the column type and the value. Remove anything private.
+    validations:
+      required: true
+  - type: input
+    id: engine
+    attributes:
+      label: Database engine and version
+      placeholder: Postgres 17, MySQL 8.4, SQLite, …
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Maben Base version
+      description: Maben Base › About Maben Base
+      placeholder: "0.1"
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version and Mac
+      placeholder: macOS 15.5, MacBook Air M3
+  - type: textarea
+    id: sql
+    attributes:
+      label: SQL or table definition
+      description: Optional. The statement that failed, or the CREATE TABLE of the table it happens on. Remove anything private.
+      render: sql

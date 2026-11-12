@@ -1,0 +1,40 @@
+# Xcode project for the release build only (./release.sh). Day-to-day building
+# uses SwiftPM (./build.sh). Generated with xcodegen; the .xcodeproj is not kept.
+name: MabenBase
+options:
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+    ENABLE_HARDENED_RUNTIME: "YES"
+    DEBUG_INFORMATION_FORMAT: dwarf
+    DEAD_CODE_STRIPPING: "YES"
+targets:
+  MabenBase:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources/Base
+      - path: build/AppIcon.icns
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_NAME: Maben Base
+        EXECUTABLE_NAME: Base
+        PRODUCT_BUNDLE_IDENTIFIER: gg.maben.base
+        INFOPLIST_FILE: build/Info-release.plist
+        GENERATE_INFOPLIST_FILE: "NO"
+    dependencies:
+      - target: BaseCore
+      - sdk: libsqlite3.tbd
+  BaseCore:
+    type: library.static
+    platform: macOS
+    sources: [Sources/BaseCore]
+    settings:
+      base:
+        PRODUCT_NAME: BaseCore
+        SKIP_INSTALL: "YES"

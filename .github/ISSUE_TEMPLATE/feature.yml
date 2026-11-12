@@ -1,0 +1,15 @@
+name: Idea
+description: Suggest something new or better, or an engine Base should support
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would help?
+      description: For a new engine, say how it connects (wire protocol, HTTP API or its own command-line tool) and where its documentation is.
