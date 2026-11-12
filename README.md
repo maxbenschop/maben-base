@@ -82,11 +82,25 @@ Needs macOS 14 or later and Xcode 16 or later (Swift 5.9+). No dependencies.
 swift test            # unit tests; see CONTRIBUTING.md for the tests against real servers
 ```
 
-Demo flags, for screenshots and trying things: `--demo --open=customers [--structure|--edit|--filter|--cells]`, `--demo --query="select 1" [--format|--explain]`, `--demo --palette`, `--demo --sheet=newTable|newView|backup|exportDatabase|snippets`, `--demo --appearance=light`, `--demo --connections`, and `--demo --url=postgres://…` to try a real server without saving anything.
+`./release.sh` builds the universal, notarized download (`dist/Maben-Base.dmg` and `.zip`), and `./publish.sh` tags it, creates the GitHub release and deploys base.maben.gg. See `CONTRIBUTING.md`.
+
+Demo flags, for screenshots and trying things: `--demo --open=customers [--structure|--edit|--filter|--cells]`, `--demo --query="select 1" [--format|--explain]`, `--demo --palette`, `--demo --sheet=newTable|newView|backup|exportDatabase|snippets`, `--demo --appearance=light`, `--demo --connections`, `--demo --settings`, and `--demo --url=postgres://…` to try a real server without saving anything.
 
 `base-tool` (`swift run BaseTool …`) runs SQL through the same drivers: `query <url> <sql>`, `schema <url>`, `ssh <user@host:port> <key|-> <url> <sql>`, and `format <sql>`.
 
 Data lives in `~/Library/Application Support/Maben Base/` (connections, history and saved queries as JSON). Passwords are in the Keychain under `gg.maben.base`.
+
+## Updates
+
+The app updates itself from GitHub Releases (`Sources/Base/Updater.swift`), the same way Maben Awake and Maben Sweep do: at
+start, every 6 hours and after waking it asks the GitHub API for the latest release, downloads `Maben-Base.zip`, and only
+installs it if the app inside is signed with the Developer ID of team NJTYRVLSA8 with bundle ID `gg.maben.base`, accepted by
+Gatekeeper, and has the announced version. The old app goes to the Trash. An automatic install never restarts the app while
+a connection window is open: it runs when none is open, or as you quit. The Update button in Settings installs at once (it
+asks first when edits are unsaved) and the open connections and tabs come back. Both switches (check, install) are on by
+default, in Settings under Updates (`UserDefaults` keys `updates.autoCheck` / `updates.autoInstall`). Apart from your
+databases, this is the only network request the app makes. `Base --verify-update <app> <version>` runs the same checks on
+an app by hand.
 
 ## How it's built
 
@@ -100,7 +114,7 @@ Each engine has its own file in `Sources/BaseCore`: `Postgres`, `MySQL`, `SQLite
 
 Values travel as text both ways: the servers send text, and edits are written as quoted literals that the server casts to the column's type. That keeps every type (JSON, arrays, UUIDs, intervals, enums) editable without a type-by-type mapping. Binary columns show as `0x…` hex and are written back as hex literals.
 
-Not in this version: self-updating, plugins, ER diagrams, and editing structure for the engines marked read-only above.
+Not in this version: plugins, ER diagrams, and editing structure for the engines marked read-only above.
 
 ## Licence
 

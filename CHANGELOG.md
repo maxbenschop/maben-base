@@ -1,6 +1,9 @@
 # Changelog
 
-## 0.1 (not released yet)
+Every release of Maben Base. The newest version is at the top. `publish.sh` uses the section for the version it
+releases as the GitHub release notes, and base.maben.gg/changelog is built from this file.
+
+## 0.1 · 12 November 2026
 
 The first version.
 
@@ -30,8 +33,8 @@ The first version.
 - Connection files to move connections between Macs (passwords encrypted with a passphrase), import from URLs, and sync through iCloud Drive
 - SSH passwords and key passphrases, TLS client certificates and CA files, Unix sockets
 - Server window for Postgres and MySQL: running queries, users and permissions, live metrics
+- Updates itself from GitHub Releases, as Maben Awake and Maben Sweep do: it checks at start and every 6 hours, verifies the Maben signature and Apple's notarization, and installs when no connection is open or as you quit. Both switches are in Settings
 
 ## Next
 
-- Self-update from GitHub Releases, as in Maben Awake and Maben Sweep
 - Structure editing for the engines that are read-only there now

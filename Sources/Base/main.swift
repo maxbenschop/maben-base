@@ -9,6 +9,7 @@ import SwiftUI
 //   --demo --query=<sql>    opens a query tab and runs it
 //   --demo --palette        shows the ⌘P palette
 //   --demo --connections    shows the connections window instead of connecting
+//   --demo --settings       shows the Settings window too
 //   --demo --appearance=light|dark   --sheet=newTable|newView|backup|exportDatabase|snippets   --format   --explain   --cells
 //   --demo --url=<url>      connects to that database instead (nothing is saved; for testing against a real server)
 //   --demo --server=processes|users|metrics   opens the server window (with --url)
@@ -22,10 +23,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         if let a = Demo.argument("appearance").flatMap(Appearance.init(rawValue:)) { a.apply() }
         if CommandLine.arguments.contains("--demo") {
             Demo.start()
+            if CommandLine.arguments.contains("--settings") { SettingsWindowController.shared.show() }
         } else {
             ConnectionsWindowController.shared.list.syncNow()
             if !SessionMemory.reopen() { ConnectionsWindowController.shared.show() }
         }
+        Updater.shared.start()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -37,6 +40,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     }
 
     @objc func showSettings(_ sender: Any?) { SettingsWindowController.shared.show() }
+    /// Opens Settings, where the result shows, and asks GitHub for the latest release.
+    @objc func checkForUpdates(_ sender: Any?) {
+        SettingsWindowController.shared.show()
+        Updater.shared.check(userInitiated: true)
+    }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         if !flag { ConnectionsWindowController.shared.show() }
@@ -45,13 +53,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         let dirty = WorkspaceWindowController.open.filter { $0.workspace.hasUnsavedChanges }
-        guard !dirty.isEmpty else { return .terminateNow }
-        let alert = NSAlert()
-        alert.messageText = "Quit with unsaved changes?"
-        alert.informativeText = "Edited rows in \(dirty.map { $0.workspace.config.displayName }.joined(separator: ", ")) haven't been written to the database."
-        alert.addButton(withTitle: "Quit without saving").hasDestructiveAction = true
-        alert.addButton(withTitle: "Cancel")
-        return alert.runModal() == .alertFirstButtonReturn ? .terminateNow : .terminateCancel
+        if !dirty.isEmpty {
+            let alert = NSAlert()
+            alert.messageText = "Quit with unsaved changes?"
+            alert.informativeText = "Edited rows in \(dirty.map { $0.workspace.config.displayName }.joined(separator: ", ")) haven't been written to the database."
+            alert.addButton(withTitle: "Quit without saving").hasDestructiveAction = true
+            alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn else { return .terminateCancel }
+        }
+        // A waiting update installs now, so the next launch is the new version.
+        if Updater.shared.installOnQuit({ NSApp.reply(toApplicationShouldTerminate: true) }) { return .terminateLater }
+        return .terminateNow
     }
 
     @objc func showConnections(_ sender: Any?) { ConnectionsWindowController.shared.show() }
@@ -116,6 +128,8 @@ enum MainMenu {
 
         menu("Maben Base", [
             item("About Maben Base", #selector(NSApplication.orderFrontStandardAboutPanel(_:)), ""),
+            .separator(),
+            item("Check for Updates…", #selector(A.checkForUpdates(_:)), ""),
             .separator(),
             item("Settings…", #selector(A.showSettings(_:)), ","),
             .separator(),
@@ -441,6 +455,8 @@ struct SeededRandom {
         return Int((state >> 33) % UInt64(max(1, n)))
     }
 }
+
+Updater.verifyIfRequested()   // --verify-update <app> <version>: prints the result and exits
 
 MainActor.assumeIsolated {
     let app = NSApplication.shared

@@ -86,7 +86,7 @@ A change that touches one of these comes with a test that shows the rule still h
 
 ## Releasing (maintainer)
 
-Releases are tags `vX.Y.Z` on `main`. `./release.sh` builds a universal app, signs it with the Developer ID and has Apple notarize it, then writes `dist/Maben-Base.dmg` and `.zip`. Add an entry to `CHANGELOG.md` and bump `CFBundleShortVersionString` in `Info.plist` first.
+Releases are tags `vX.Y.Z` on `main`. Add a section `## X.Y · <date>` to `CHANGELOG.md` and bump `CFBundleShortVersionString` in `Info.plist` first. `./release.sh` builds a universal app, signs it with the Developer ID and has Apple notarize it, then writes `dist/Maben-Base.dmg` and `.zip`. `./publish.sh` then tags the commit, creates the GitHub release with both files (notes from `CHANGELOG.md`) and rebuilds and deploys base.maben.gg. Installed copies see the release within 6 hours and update themselves, so only publish what you would install yourself.
 
 ## Style
 

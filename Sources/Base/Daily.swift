@@ -36,10 +36,10 @@ final class SettingsWindowController: NSWindowController {
     static let shared = SettingsWindowController()
 
     private init() {
-        let window = makeMabenWindow(size: NSSize(width: 560, height: 430), autosave: "MabenBaseSettings", resizable: false)
+        let window = makeMabenWindow(size: NSSize(width: 560, height: 490), autosave: "MabenBaseSettings", resizable: false)
         window.title = "Settings"
         super.init(window: window)
-        window.setContent(SettingsView(), size: NSSize(width: 560, height: 430), autosave: "MabenBaseSettings")
+        window.setContent(SettingsView(), size: NSSize(width: 560, height: 490), autosave: "MabenBaseSettings")
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -58,6 +58,8 @@ struct SettingsView: View {
     @State private var rowLimit = Preferences.queryRowLimit
     @State private var sync = Preferences.syncThroughICloud
     @State private var syncNote: String?
+    @ObservedObject private var updater = Updater.shared
+    @State private var showNotes = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -99,6 +101,21 @@ struct SettingsView: View {
                         .font(.system(size: 11.5)).foregroundStyle(syncNote == nil ? MB.dim : MB.orange).fixedSize(horizontal: false, vertical: true)
                 }
             }
+            row("Updates") {
+                VStack(alignment: .leading, spacing: 7) {
+                    HStack(spacing: 8) {
+                        Text(updateTitle).fontWeight(.medium)
+                        updateButtons
+                    }
+                    Text(updateDetail).font(.system(size: 11.5)).foregroundStyle(updateFailed ? MB.orange : MB.dim)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Toggle("Check for updates automatically", isOn: $updater.autoCheck).toggleStyle(.checkbox)
+                    Toggle("Install updates automatically", isOn: $updater.autoInstall).toggleStyle(.checkbox)
+                        .disabled(!updater.autoCheck)
+                    Text("Checking asks GitHub for the latest release at start and every 6 hours. An update installs when no connection is open, or as you quit, after its Maben signature and Apple's notarization are checked.")
+                        .font(.system(size: 11.5)).foregroundStyle(MB.dim).fixedSize(horizontal: false, vertical: true)
+                }
+            }
             Spacer()
         }
         .font(.system(size: 12.5))
@@ -110,11 +127,68 @@ struct SettingsView: View {
         .ignoresSafeArea()
     }
 
+    // Version, the Update button and what the last check found (as in Maben Awake and Maben Sweep).
+    private var updateTitle: String {
+        if let r = updater.available { return "Version \(r.version) is available" }
+        return isBundled ? "Maben Base \(updater.currentVersion)" : "Development copy"
+    }
+
+    private var updateFailed: Bool {
+        if case .failed = updater.state { return true }
+        return false
+    }
+
+    private var updateDetail: String {
+        switch updater.state {
+        case .idle: return isBundled ? "Not checked yet." : "Updates only work in the installed app."
+        case .checking: return "Checking GitHub…"
+        case .upToDate(let date): return "Up to date. Checked \(date.formatted(.relative(presentation: .named)))."
+        case .available: return updater.canInstall ? "Installs in a few seconds, then restarts with the same connections and tabs." : "Move the app to Applications to update."
+        case .downloading(_, let p): return "Downloading… \(Int(p * 100))%"
+        case .installing: return "Installing. Maben Base restarts in a moment."
+        case .failed(let message): return message
+        }
+    }
+
+    @ViewBuilder private var updateButtons: some View {
+        switch updater.state {
+        case .available(let release):
+            Button("What's new") { showNotes.toggle() }
+                .buttonStyle(.mbQuiet)
+                .popover(isPresented: $showNotes, arrowEdge: .bottom) { ReleaseNotes(release: release) }
+            Button("Update") { updater.update() }.buttonStyle(.mbPrimary).disabled(!updater.canInstall)
+        case .checking, .downloading, .installing:
+            ProgressView().controlSize(.small)
+        default:
+            Button("Check now") { updater.check(userInitiated: true) }.buttonStyle(.mbQuiet).disabled(!isBundled)
+        }
+    }
+
     private func row<C: View>(_ label: String, @ViewBuilder _ content: () -> C) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 14) {
             Text(label).foregroundStyle(MB.muted).frame(width: 110, alignment: .trailing)
             content()
         }
+    }
+}
+
+/// The notes of a waiting release, from its GitHub page.
+private struct ReleaseNotes: View {
+    let release: Updater.Release
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Maben Base \(release.version)").font(.system(size: 13, weight: .semibold))
+            ScrollView {
+                Text((try? AttributedString(markdown: release.notes, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)))
+                     ?? AttributedString(release.notes))
+                    .font(.system(size: 12))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(maxHeight: 220)
+            Link("Open on GitHub", destination: release.page).font(.system(size: 12))
+        }
+        .frame(width: 320)
+        .padding(16)
     }
 }
 
