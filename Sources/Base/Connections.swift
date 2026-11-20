@@ -133,7 +133,11 @@ final class ConnectionList: ObservableObject {
 
 @MainActor
 final class ConnectionsWindowController: NSWindowController, NSWindowDelegate {
-    static var shared = ConnectionsWindowController(list: ConnectionList(store: Store()))
+    /// --demo puts its own list here. Until it has, the list is empty, so a demo never reads your saved
+    /// connections or asks the Keychain for their passwords.
+    static var shared = ConnectionsWindowController(list: CommandLine.arguments.contains("--demo")
+        ? ConnectionList(store: Store(), persist: false, initial: [])
+        : ConnectionList(store: Store()))
     let list: ConnectionList
 
     init(list: ConnectionList) {

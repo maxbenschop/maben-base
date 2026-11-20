@@ -84,7 +84,7 @@ swift test            # unit tests; see CONTRIBUTING.md for the tests against re
 
 `./release.sh` builds the universal, notarized download (`dist/Maben-Base.dmg` and `.zip`), and `./publish.sh` tags it, creates the GitHub release and deploys base.maben.gg. See `CONTRIBUTING.md`.
 
-Demo flags, for screenshots and trying things: `--demo --open=customers [--structure|--edit|--filter|--cells]`, `--demo --query="select 1" [--format|--explain]`, `--demo --palette`, `--demo --sheet=newTable|newView|backup|exportDatabase|snippets`, `--demo --appearance=light`, `--demo --connections`, `--demo --settings`, and `--demo --url=postgres://…` to try a real server without saving anything.
+Demo flags, for screenshots and trying things: `--demo --open=customers [--structure|--edit|--filter|--cells]`, `--demo --query="select 1" [--format|--explain]`, `--demo --palette`, `--demo --sheet=newTable|newView|backup|exportDatabase|snippets`, `--demo --appearance=light`, `--demo --connections`, `--demo --settings`, and `--demo --url=postgres://…` to try a real server without saving anything. `--demo --open=orders --bench` scrolls the grid and prints the work per frame (add `--url=` for a table of your own, or `--query="select …" --all` for every row of a result), and `--background` keeps a demo behind the window you're working in.
 
 `base-tool` (`swift run BaseTool …`) runs SQL through the same drivers: `query <url> <sql>`, `schema <url>`, `ssh <user@host:port> <key|-> <url> <sql>`, and `format <sql>`.
 

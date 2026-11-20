@@ -12,5 +12,7 @@ let package = Package(
         // `base-tool query <url> <sql>`: runs SQL through the same drivers and prints the result.
         .executableTarget(name: "BaseTool", dependencies: ["BaseCore"], path: "Sources/BaseTool"),
         .testTarget(name: "BaseCoreTests", dependencies: ["BaseCore"], path: "Tests/BaseCoreTests"),
+        // The app's own views, built off screen.
+        .testTarget(name: "BaseTests", dependencies: ["Base"], path: "Tests/BaseTests"),
     ]
 )

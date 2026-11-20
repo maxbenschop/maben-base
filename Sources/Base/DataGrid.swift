@@ -62,29 +62,32 @@ struct DataGrid: NSViewRepresentable {
 
     func makeCoordinator() -> Coordinator { Coordinator(source: source) }
 
-    func makeNSView(context: Context) -> NSScrollView {
+    func makeNSView(context: Context) -> NSScrollView { Self.makeScrollView(context.coordinator) }
+
+    /// The grid as AppKit views (apart from SwiftUI, so the tests can build one).
+    static func makeScrollView(_ coordinator: Coordinator) -> NSScrollView {
         let table = GridTableView()
-        table.coordinator = context.coordinator
+        table.coordinator = coordinator
         table.style = .plain
         table.usesAlternatingRowBackgroundColors = false
         table.backgroundColor = MB.nsBg
-        table.gridColor = MB.nsGrid
-        table.gridStyleMask = [.solidHorizontalGridLineMask]  // column lines are drawn per row, so they stop at the last row
+        table.gridStyleMask = []  // rows draw their own lines, so they stop at the last row
         table.intercellSpacing = NSSize(width: 0, height: 0)
         table.rowHeight = 24
+        table.allowsTypeSelect = false
         table.allowsMultipleSelection = true
         table.allowsColumnReordering = true
         table.allowsColumnResizing = true
         table.columnAutoresizingStyle = .noColumnAutoresizing
         table.headerView = GridHeaderView()
         table.headerView?.frame.size.height = 26
-        table.headerView?.menu = context.coordinator.makeHeaderMenu()
-        table.delegate = context.coordinator
-        table.dataSource = context.coordinator
-        table.target = context.coordinator
+        table.headerView?.menu = coordinator.makeHeaderMenu()
+        table.delegate = coordinator
+        table.dataSource = coordinator
+        table.target = coordinator
         table.doubleAction = #selector(Coordinator.doubleClicked(_:))
-        table.menu = context.coordinator.makeMenu()
-        context.coordinator.table = table
+        table.menu = coordinator.makeMenu()
+        coordinator.table = table
 
         let scroll = NSScrollView()
         scroll.documentView = table
@@ -97,8 +100,8 @@ struct DataGrid: NSViewRepresentable {
         // The window's title bar is drawn by SwiftUI above us; don't inset for it again.
         scroll.automaticallyAdjustsContentInsets = false
         scroll.contentInsets = NSEdgeInsets()
-        context.coordinator.rebuildColumns()
-        NotificationCenter.default.addObserver(forName: .demoSelectCells, object: nil, queue: .main) { [weak coordinator = context.coordinator] _ in
+        coordinator.rebuildColumns()
+        NotificationCenter.default.addObserver(forName: .demoSelectCells, object: nil, queue: .main) { [weak coordinator] _ in
             MainActor.assumeIsolated {
                 coordinator?.select((1, 1), extend: false)
                 coordinator?.select((3, 3), extend: true)
@@ -134,8 +137,11 @@ struct DataGrid: NSViewRepresentable {
         var lastColumnsVersion = -1
         /// The selected cells (TablePlus-style); rows are selected along with them.
         var range: CellRange?
-        private var editing: (row: Int, column: Int)?
+        /// The cell being typed in: data column, not display position.
+        private(set) var editing: (row: Int, column: Int)?
+        private var editor: NSTextField?
         private var applyingLayout = false
+        private var slotCache: [Slot]?
         private let headerMenu = NSMenu()
 
         init(source: GridSource) { self.source = source }
@@ -166,8 +172,30 @@ struct DataGrid: NSViewRepresentable {
             return Int(table.tableColumns[displayCol].identifier.rawValue)
         }
 
+        /// Where a shown column sits and what it holds, worked out once per layout instead of once per cell drawn.
+        struct Slot {
+            let x: CGFloat
+            let width: CGFloat
+            let column: Int
+            let isLink: Bool
+        }
+
+        var slots: [Slot] {
+            if let slotCache { return slotCache }
+            guard let table else { return [] }
+            let made = table.tableColumns.indices.compactMap { i -> Slot? in
+                guard let column = dataColumn(i) else { return nil }
+                let rect = table.rect(ofColumn: i)
+                return Slot(x: rect.minX, width: rect.width, column: column, isLink: source.gridForeignKey(column: column) != nil)
+            }
+            slotCache = made
+            return made
+        }
+
         func rebuildColumns() {
             guard let table else { return }
+            dropEditor()
+            slotCache = nil
             applyingLayout = true
             defer { applyingLayout = false }
             for c in table.tableColumns { table.removeTableColumn(c) }
@@ -198,6 +226,8 @@ struct DataGrid: NSViewRepresentable {
                 }
                 column.minWidth = 40
                 column.maxWidth = 2000
+                column.isEditable = false  // editing goes through beginEditing, with our own field
+                column.dataCell = textCell
                 column.sortDescriptorPrototype = NSSortDescriptor(key: "\(i)", ascending: true)
                 table.addTableColumn(column)
             }
@@ -213,8 +243,18 @@ struct DataGrid: NSViewRepresentable {
             layout = l
         }
 
-        func tableViewColumnDidResize(_ notification: Notification) { saveLayout() }
-        func tableViewColumnDidMove(_ notification: Notification) { saveLayout() }
+        /// What the table falls back on when it draws a cell itself (the picture of a column being dragged).
+        private let textCell: NSTextFieldCell = {
+            let cell = NSTextFieldCell(textCell: "")
+            cell.font = MB.nsMono
+            cell.textColor = MB.nsText
+            cell.lineBreakMode = .byTruncatingTail
+            cell.usesSingleLineMode = true
+            return cell
+        }()
+
+        func tableViewColumnDidResize(_ notification: Notification) { slotCache = nil; saveLayout() }
+        func tableViewColumnDidMove(_ notification: Notification) { slotCache = nil; saveLayout() }
 
         func setHidden(_ name: String, _ hidden: Bool) {
             saveLayout()
@@ -236,6 +276,7 @@ struct DataGrid: NSViewRepresentable {
 
         func reloadKeepingSelection() {
             guard let table else { return }
+            dropEditor()
             let selected = table.selectedRowIndexes
             table.reloadData()
             let valid = selected.filteredIndexSet { $0 < source.gridRowCount }
@@ -247,26 +288,14 @@ struct DataGrid: NSViewRepresentable {
 
         func numberOfRows(in tableView: NSTableView) -> Int { source.gridRowCount }
 
-        func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-            guard let tableColumn, let column = Int(tableColumn.identifier.rawValue) else { return nil }
-            let id = NSUserInterfaceItemIdentifier("cell")
-            let cell = (tableView.makeView(withIdentifier: id, owner: nil) as? GridCell) ?? GridCell(identifier: id)
-            let value = source.gridValue(row: row, column: column)
-            let display = tableView.tableColumns.firstIndex(of: tableColumn) ?? -1
-            let inRange = range?.contains(row: row, col: display) ?? false
-            let isFocus = range.map { $0.focus.row == row && $0.focus.col == display } ?? false
-            cell.configure(value: value, edited: source.gridIsEdited(row: row, column: column), state: source.gridRowState(row),
-                           selected: inRange && !(range?.isSingle ?? true), focus: isFocus,
-                           link: value != nil && source.gridForeignKey(column: column) != nil)
-            cell.onFollow = { [weak self] in self?.source.gridFollow(row: row, column: column) }
-            return cell
+        /// The grid draws its own cells (GridTableView.drawRow); this is what VoiceOver and other tools read.
+        func tableView(_ tableView: NSTableView, objectValueFor tableColumn: NSTableColumn?, row: Int) -> Any? {
+            guard let tableColumn, let column = Int(tableColumn.identifier.rawValue),
+                  row < source.gridRowCount, column < source.gridColumns.count else { return nil }
+            return source.gridValue(row: row, column: column) ?? "NULL"
         }
 
-        func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
-            let view = GridRowView()
-            view.state = source.gridRowState(row)
-            return view
-        }
+        func tableView(_ tableView: NSTableView, shouldEdit tableColumn: NSTableColumn?, row: Int) -> Bool { false }
 
         func tableView(_ tableView: NSTableView, sortDescriptorsDidChange oldDescriptors: [NSSortDescriptor]) {
             guard let d = tableView.sortDescriptors.first, let key = d.key, let column = Int(key) else { return }
@@ -286,9 +315,9 @@ struct DataGrid: NSViewRepresentable {
             if extend, var r = range { r.focus = cell; range = r } else { range = CellRange(anchor: cell, focus: cell) }
             guard let r = range else { return }
             table.selectRowIndexes(IndexSet(integersIn: r.rows), byExtendingSelection: false)
-            var rows = IndexSet(integersIn: r.rows)
-            if let old { rows.formUnion(IndexSet(integersIn: old.rows)) }
-            table.reloadData(forRowIndexes: rows, columnIndexes: IndexSet(integersIn: 0..<table.numberOfColumns))
+            // Repaint the rows the old and the new selection cover, as far as they're drawn at all.
+            let first = min(r.rows.lowerBound, old?.rows.lowerBound ?? .max), last = max(r.rows.upperBound, old?.rows.upperBound ?? 0)
+            table.setNeedsDisplay(table.rect(ofRow: first).union(table.rect(ofRow: last)).intersection(table.preparedContentRect.union(table.visibleRect)))
             table.scrollRowToVisible(cell.row)
             table.scrollColumnToVisible(cell.col)
         }
@@ -367,26 +396,42 @@ struct DataGrid: NSViewRepresentable {
         }
 
         func beginEditing(row: Int, tableColumn: Int) {
-            guard let table, source.canEdit, source.gridRowState(row) != .deleted, tableColumn < table.numberOfColumns,
-                  let column = dataColumn(tableColumn),
-                  let cell = table.view(atColumn: tableColumn, row: row, makeIfNecessary: true) as? GridCell else { return }
+            guard let table, source.canEdit, row < source.gridRowCount, source.gridRowState(row) != .deleted,
+                  tableColumn < table.numberOfColumns, let column = dataColumn(tableColumn) else { return }
+            dropEditor()
+            table.scrollRowToVisible(row)
+            table.scrollColumnToVisible(tableColumn)
+            // One field, placed over the cell while it's being typed in.
+            let field = NSTextField(labelWithString: source.gridValue(row: row, column: column) ?? "")
+            field.font = MB.nsMono
+            field.textColor = MB.nsText
+            field.lineBreakMode = .byTruncatingTail
+            field.maximumNumberOfLines = 1
+            field.cell?.usesSingleLineMode = true
+            field.focusRingType = .none
+            field.isEditable = true
+            field.isSelectable = true
+            let cell = table.frameOfCell(atColumn: tableColumn, row: row)
+            let height = min(cell.height, field.fittingSize.height)
+            // A label keeps 2 pt around its text: this puts what's typed exactly where the value was drawn.
+            field.frame = NSRect(x: cell.minX + 5, y: cell.midY - height / 2, width: max(10, cell.width - 8), height: height)
+            field.delegate = self
+            table.addSubview(field)
             editing = (row, column)
-            let value = source.gridValue(row: row, column: column)
-            cell.beginEditing(value)
-            cell.field.delegate = self
-            table.window?.makeFirstResponder(cell.field)
-            cell.field.currentEditor()?.selectAll(nil)
+            editor = field
+            table.setNeedsDisplay(cell)  // the cell's own text makes way for the field
+            table.window?.makeFirstResponder(field)
+            field.currentEditor()?.selectAll(nil)
         }
 
         func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
             if selector == #selector(NSResponder.cancelOperation(_:)) {
-                editing = nil
-                endFieldEditing(control, commit: false)
+                endFieldEditing(commit: false)
                 return true
             }
             if selector == #selector(NSResponder.insertNewline(_:)) || selector == #selector(NSResponder.insertTab(_:)) {
                 let tab = selector == #selector(NSResponder.insertTab(_:))
-                endFieldEditing(control, commit: true)
+                endFieldEditing(commit: true)
                 moveFocus(dRow: tab ? 0 : 1, dCol: tab ? 1 : 0, extend: false)
                 return true
             }
@@ -394,25 +439,39 @@ struct DataGrid: NSViewRepresentable {
         }
 
         func controlTextDidEndEditing(_ obj: Notification) {
-            guard let field = obj.object as? NSTextField else { return }
-            endFieldEditing(field, commit: true)
+            guard obj.object as? NSTextField === editor else { return }
+            endFieldEditing(commit: true)
         }
 
-        private func endFieldEditing(_ control: NSControl, commit: Bool) {
-            guard let field = control as? NSTextField else { return }
+        private func endFieldEditing(commit: Bool) {
+            guard let field = editor else { return }
             let target = editing
-            editing = nil
-            field.isEditable = false
-            field.delegate = nil
-            if commit, let target {
-                let newValue = field.stringValue
+            let newValue = field.stringValue
+            removeEditor()
+            if commit, let target, target.row < source.gridRowCount {
                 let old = source.gridValue(row: target.row, column: target.column)
                 if newValue != (old ?? "") || (old == nil && !newValue.isEmpty) {
                     source.gridEdit(row: target.row, column: target.column, value: newValue)
                 }
             }
-            table?.window?.makeFirstResponder(table)
             reloadKeepingSelection()
+        }
+
+        /// Takes the field away without saving what's in it: the rows under it changed.
+        private func dropEditor() {
+            guard editor != nil else { return }
+            removeEditor()
+        }
+
+        private func removeEditor() {
+            guard let field = editor else { return }
+            editing = nil
+            editor = nil
+            field.delegate = nil
+            if let table, let window = table.window, (window.firstResponder as? NSView)?.isDescendant(of: field) == true {
+                window.makeFirstResponder(table)
+            }
+            field.removeFromSuperview()
         }
 
         // MARK: Menus
@@ -595,6 +654,13 @@ final class GridTableView: NSTableView {
             return super.mouseDown(with: event)
         }
         window?.makeFirstResponder(self)
+        // The arrow in a cell that points at another table opens the row it points at.
+        if let slot = coordinator.slots[safe: c], slot.isLink, !flags.contains(.shift), r < coordinator.source.gridRowCount,
+           linkRect(in: frameOfCell(atColumn: c, row: r)).insetBy(dx: -3, dy: -3).contains(p),
+           coordinator.source.gridValue(row: r, column: slot.column) != nil {
+            coordinator.source.gridFollow(row: r, column: slot.column)
+            return
+        }
         coordinator.select((r, c), extend: flags.contains(.shift))
         // Drag to select a rectangle of cells.
         while let e = window?.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) {
@@ -639,116 +705,157 @@ final class GridTableView: NSTableView {
         return super.validateUserInterfaceItem(item)
     }
 
-    override func drawGrid(inClipRect clipRect: NSRect) {
-        // Only draw lines under real rows, not down the empty space.
-        guard numberOfRows > 0 else { return }
-        let last = rect(ofRow: numberOfRows - 1)
-        super.drawGrid(inClipRect: NSIntersectionRect(clipRect, NSRect(x: clipRect.minX, y: 0, width: clipRect.width, height: last.maxY)))
-    }
-}
+    // MARK: Drawing
+    //
+    // The table paints its cells itself, a row at a time, and only the part that's on screen. A view per cell
+    // (a text field and a link button, laid out with constraints) cost so much that a wide table couldn't
+    // keep up with scrolling.
 
-final class GridCell: NSTableCellView {
-    let field = NSTextField(labelWithString: "")
-    private let link = NSButton()
-    private var trailing: NSLayoutConstraint!
-    var onFollow: (() -> Void)?
+    private let textFont = MB.nsMono
+    private let nullFont = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+    private lazy var textLook = look(textFont)
+    private lazy var nullLook = look(nullFont)
+    private lazy var nullLine = CTLineCreateWithAttributedString(NSAttributedString(string: "NULL", attributes: nullLook.attributes))
+    private var linkMarks: [NSAppearance.Name: NSImage] = [:]
 
-    init(identifier: NSUserInterfaceItemIdentifier) {
-        super.init(frame: .zero)
-        self.identifier = identifier
-        field.translatesAutoresizingMaskIntoConstraints = false
-        field.lineBreakMode = .byTruncatingTail
-        field.maximumNumberOfLines = 1
-        field.cell?.usesSingleLineMode = true
-        field.drawsBackground = false
-        field.isBordered = false
-        field.focusRingType = .none
-        addSubview(field)
-        textField = field
-        link.translatesAutoresizingMaskIntoConstraints = false
-        link.isBordered = false
-        link.image = NSImage(systemSymbolName: "arrow.up.right", accessibilityDescription: "Open referenced row")?
-            .withSymbolConfiguration(.init(pointSize: 9, weight: .semibold))
-        link.contentTintColor = MB.nsDim
-        link.imageScaling = .scaleProportionallyDown
-        link.target = self
-        link.action = #selector(followLink)
-        link.toolTip = "Open the referenced row"
-        addSubview(link)
-        trailing = field.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -5)
-        NSLayoutConstraint.activate([
-            field.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 7),
-            trailing,
-            field.centerYAnchor.constraint(equalTo: centerYAnchor),
-            link.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
-            link.centerYAnchor.constraint(equalTo: centerYAnchor),
-            link.widthAnchor.constraint(equalToConstant: 13),
-            link.heightAnchor.constraint(equalToConstant: 13),
-        ])
-        wantsLayer = true
+    /// The arrow for cells that point at another table, in the colour for the appearance being drawn in.
+    private var linkMark: NSImage? {
+        let name = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) ?? .aqua
+        if let made = linkMarks[name] { return made }
+        let colour = NSColor(cgColor: MB.nsDim.cgColor) ?? MB.nsDim
+        let made = NSImage(systemSymbolName: "arrow.up.right", accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 9, weight: .semibold).applying(.init(paletteColors: [colour])))
+        linkMarks[name] = made
+        return made
     }
 
-    required init?(coder: NSCoder) { fatalError() }
+    private struct Look {
+        let attributes: [NSAttributedString.Key: Any]
+        let ellipsis: CTLine
+        /// From the top of the row to the text's baseline, so it sits where a label centred in the row would.
+        let baseline: CGFloat
+        let characterWidth: CGFloat
+    }
 
-    @objc private func followLink() { onFollow?() }
+    private func look(_ font: NSFont) -> Look {
+        // The colour comes from the context, so one set of attributes serves every colour and appearance.
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: font, NSAttributedString.Key(kCTForegroundColorFromContextAttributeName as String): true]
+        // Where a label with this font, centred in the row, puts its text.
+        let label = NSTextField(labelWithString: "0")
+        label.font = font
+        return Look(attributes: attributes,
+                    ellipsis: CTLineCreateWithAttributedString(NSAttributedString(string: "…", attributes: attributes)),
+                    baseline: (rowHeight - label.fittingSize.height) / 2 + label.firstBaselineOffsetFromTop,
+                    characterWidth: max(1, ("0" as NSString).size(withAttributes: [.font: font]).width))
+    }
 
-    func configure(value: String?, edited: Bool, state: RowState, selected: Bool, focus: Bool, link showLink: Bool) {
-        field.isEditable = false
-        if let value {
-            var shown = value.count > 500 ? String(value.prefix(500)) : value
-            if shown.contains(where: \.isNewline) { shown = shown.replacingOccurrences(of: "\n", with: "↵ ").replacingOccurrences(of: "\r", with: "") }
-            field.stringValue = shown
-            field.font = MB.nsMono
-            field.textColor = state == .deleted ? MB.nsNull : MB.nsText
-        } else {
-            field.stringValue = "NULL"
-            field.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
-            field.textColor = MB.nsNull
+    /// The link mark's area in a cell that points at another table.
+    func linkRect(in cell: NSRect) -> NSRect { NSRect(x: cell.maxX - 17, y: cell.midY - 6.5, width: 13, height: 13) }
+
+    private var isEmphasized: Bool {
+        guard let window, window.isKeyWindow, let responder = window.firstResponder as? NSView else { return false }
+        return responder.isDescendant(of: self)
+    }
+
+    override func highlightSelection(inClipRect clipRect: NSRect) {}  // drawRow does it, under the cells
+
+    override func drawRow(_ row: Int, clipRect: NSRect) {
+        guard let coordinator, let context = NSGraphicsContext.current?.cgContext else { return }
+        let source = coordinator.source
+        let columnCount = source.gridColumns.count
+        guard row < source.gridRowCount else { return }
+        let rowRect = rect(ofRow: row)
+        let state = source.gridRowState(row)
+        let range = coordinator.range, editing = coordinator.editing
+        let multiple = !(range?.isSingle ?? true)
+
+        func fill(_ color: NSColor, _ rect: NSRect) {
+            context.setFillColor(color.cgColor)
+            context.fill(rect)
         }
-        link.isHidden = !showLink
-        trailing.constant = showLink ? -21 : -5
-        effectiveAppearance.performAsCurrentDrawingAppearance {
-            if edited { layer?.backgroundColor = MB.nsAccent.withAlphaComponent(0.22).cgColor }
-            else if selected { layer?.backgroundColor = MB.nsAccent.withAlphaComponent(0.11).cgColor }
-            else { layer?.backgroundColor = nil }
-            layer?.borderWidth = focus ? 1.5 : 0
-            layer?.borderColor = focus ? MB.nsAccentInk.cgColor : nil
-        }
-    }
-
-    func beginEditing(_ value: String?) {
-        field.stringValue = value ?? ""
-        field.textColor = MB.nsText
-        field.font = MB.nsMono
-        field.isEditable = true
-        field.isSelectable = true
-        link.isHidden = true
-        trailing.constant = -5
-    }
-}
-
-final class GridRowView: NSTableRowView {
-    var state: RowState = .normal
-
-    override func drawBackground(in dirtyRect: NSRect) {
         switch state {
-        case .inserted: MB.nsGreen.withAlphaComponent(0.12).setFill()
-        case .deleted: MB.nsRed.withAlphaComponent(0.13).setFill()
-        case .normal: MB.nsBg.setFill()
+        case .inserted: fill(MB.nsGreen.withAlphaComponent(0.12), rowRect)
+        case .deleted: fill(MB.nsRed.withAlphaComponent(0.13), rowRect)
+        case .normal: break
         }
-        dirtyRect.fill()
-        guard let table = superview as? NSTableView else { return }
-        MB.nsGrid.setFill()
-        for i in 0..<table.numberOfColumns {
-            let x = table.rect(ofColumn: i).maxX - 1
-            NSRect(x: x, y: 0, width: 1, height: bounds.height).fill()
+        if isRowSelected(row) { fill(MB.nsWash(isEmphasized ? 0.09 : 0.06), rowRect) }
+        fill(MB.nsGrid, NSRect(x: rowRect.minX, y: rowRect.maxY - 1, width: rowRect.width, height: 1))
+
+        let textColor = (state == .deleted ? MB.nsNull : MB.nsText).cgColor, nullColor = MB.nsNull.cgColor
+        context.textMatrix = CGAffineTransform(scaleX: 1, y: -1)  // the table counts down from the top
+        for (display, slot) in coordinator.slots.enumerated() where slot.x < clipRect.maxX && slot.x + slot.width > clipRect.minX {
+            let cell = NSRect(x: slot.x, y: rowRect.minY, width: slot.width, height: rowRect.height)
+            fill(MB.nsGrid, NSRect(x: cell.maxX - 1, y: cell.minY, width: 1, height: cell.height))
+            guard slot.column < columnCount else { continue }
+            if source.gridIsEdited(row: row, column: slot.column) {
+                fill(MB.nsAccent.withAlphaComponent(0.22), cell)
+            } else if multiple, range?.contains(row: row, col: display) == true {
+                fill(MB.nsAccent.withAlphaComponent(0.11), cell)
+            }
+            let isEditing = editing.map { $0.row == row && $0.column == slot.column } ?? false
+            if !isEditing {
+                let value = source.gridValue(row: row, column: slot.column)
+                let showLink = slot.isLink && value != nil
+                let width = cell.width - (showLink ? 28 : 12)
+                if width > 4 {
+                    let line: CTLine
+                    if let value {
+                        line = self.line(value, width: width)
+                        context.setFillColor(textColor)
+                    } else {
+                        line = nullLine
+                        context.setFillColor(nullColor)
+                    }
+                    context.saveGState()
+                    context.clip(to: cell)
+                    context.textPosition = CGPoint(x: cell.minX + 7, y: cell.minY + (value == nil ? nullLook : textLook).baseline)
+                    CTLineDraw(fitted(line, width: width, look: value == nil ? nullLook : textLook), context)
+                    context.restoreGState()
+                }
+                if showLink, let linkMark = linkMark {
+                    let box = linkRect(in: cell), size = linkMark.size
+                    linkMark.draw(in: NSRect(x: box.midX - size.width / 2, y: box.midY - size.height / 2 + 0.5, width: size.width, height: size.height),
+                                  from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+                }
+            }
+            if let range, range.focus.row == row, range.focus.col == display {
+                context.setStrokeColor(MB.nsAccentInk.cgColor)
+                context.setLineWidth(1.5)
+                context.stroke(cell.insetBy(dx: 0.75, dy: 0.75))
+            }
         }
     }
 
-    override func drawSelection(in dirtyRect: NSRect) {
-        MB.nsWash(isEmphasized ? 0.09 : 0.06).setFill()
-        bounds.fill()
+    /// One line of a value: only as much of it as can show, with line breaks marked.
+    private func line(_ value: String, width: CGFloat) -> CTLine {
+        // Wide characters aside, no more than this fits; the rest is never measured or drawn.
+        let limit = min(500, Int(width / textLook.characterWidth) + 8)
+        var shown = String(value.prefix(limit))
+        if shown.contains(where: \.isNewline) { shown = shown.replacingOccurrences(of: "\n", with: "↵ ").replacingOccurrences(of: "\r", with: "") }
+        return CTLineCreateWithAttributedString(NSAttributedString(string: shown, attributes: textLook.attributes))
     }
+
+    private func fitted(_ line: CTLine, width: CGFloat, look: Look) -> CTLine {
+        guard CTLineGetTypographicBounds(line, nil, nil, nil) > Double(width) else { return line }
+        return CTLineCreateTruncatedLine(line, Double(width), .end, look.ellipsis) ?? line
+    }
+
+    // The selection is brighter while the grid has the keyboard.
+    override func becomeFirstResponder() -> Bool { needsDisplay = true; return super.becomeFirstResponder() }
+    override func resignFirstResponder() -> Bool { needsDisplay = true; return super.resignFirstResponder() }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        NotificationCenter.default.removeObserver(self, name: NSWindow.didBecomeKeyNotification, object: nil)
+        NotificationCenter.default.removeObserver(self, name: NSWindow.didResignKeyNotification, object: nil)
+        guard let window else { return }
+        for name in [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification] {
+            NotificationCenter.default.addObserver(self, selector: #selector(keyStateChanged(_:)), name: name, object: window)
+        }
+    }
+
+    @objc private func keyStateChanged(_ notification: Notification) { needsDisplay = true }
 }
 
 final class GridHeaderView: NSTableHeaderView {
@@ -799,4 +906,8 @@ final class GridHeaderCell: NSTableHeaderCell {
             arrow.draw(at: NSPoint(x: cellFrame.maxX - 16, y: cellFrame.midY - 6))
         }
     }
+}
+
+private extension Array {
+    subscript(safe index: Int) -> Element? { indices.contains(index) ? self[index] : nil }
 }

@@ -6,13 +6,15 @@ import SwiftUI
 //
 //   --demo   opens a sample SQLite database in a temporary folder; your saved connections aren't read or changed.
 //   --demo --open=<table> [--structure] [--edit] [--filter]   opens a table (with staged edits, or the filter bar)
-//   --demo --query=<sql>    opens a query tab and runs it
+//   --demo --query=<sql> [--all]   opens a query tab and runs it (--all: keeps every row, as Load all does)
 //   --demo --palette        shows the ⌘P palette
 //   --demo --connections    shows the connections window instead of connecting
 //   --demo --settings       shows the Settings window too
 //   --demo --appearance=light|dark   --sheet=newTable|newView|backup|exportDatabase|snippets   --format   --explain   --cells
 //   --demo --url=<url>      connects to that database instead (nothing is saved; for testing against a real server)
 //   --demo --server=processes|users|metrics   opens the server window (with --url)
+//   --demo --open=<table> --bench   scrolls the grid and prints the time per frame, then quits
+//   --demo --background     doesn't come to the front (for scripted checks while you work)
 //   --demo --also=<url>     opens a second connection too (window tabs)   --split   shows two tabs side by side
 
 @MainActor
@@ -306,6 +308,8 @@ enum Demo {
         }
     }
 
+    static var staysBehind: Bool { CommandLine.arguments.contains("--background") || CommandLine.arguments.contains("--bench") }
+
     static func argument(_ name: String) -> String? {
         CommandLine.arguments.first { $0.hasPrefix("--\(name)=") }.map { String($0.dropFirst(name.count + 3)) }
     }
@@ -337,6 +341,11 @@ enum Demo {
             if let sql = argument("query") {
                 let q = workspace.newQuery(text: sql)
                 if !args.contains("--format") && !args.contains("--explain") { q.run(sql) }
+                if args.contains("--all") {
+                    for _ in 0..<600 where q.running || q.current == nil { try? await Task.sleep(nanoseconds: 100_000_000) }
+                    q.loadAll()
+                    try? await Task.sleep(nanoseconds: 200_000_000)
+                }
             }
             if args.contains("--palette") { workspace.palette = .open }
             if args.contains("--split"), let other = workspace.objects.first(where: { $0.name == "customers" }) {
@@ -356,6 +365,13 @@ enum Demo {
             if args.contains("--cells"), let tab = workspace.activeTable {
                 try? await Task.sleep(nanoseconds: 400_000_000)
                 NotificationCenter.default.post(name: .demoSelectCells, object: tab)
+            }
+            if args.contains("--bench") {
+                for _ in 0..<1200 where workspace.activeTable?.rows.isEmpty ?? (workspace.activeQuery.map { $0.running || $0.current == nil } ?? true) {
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                }
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                GridBench.run(in: workspace.window)
             }
         }
     }

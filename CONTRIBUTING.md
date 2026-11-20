@@ -20,8 +20,9 @@ Found a bug or have an idea? Open an issue first if you're not sure it fits; sma
 2. Build with `swift build`. `./build.sh demo` opens the app on a sample SQLite database without touching your saved connections.
 3. Run `swift test`. The server tests are skipped unless you point them at real databases (below).
 4. If you change a driver or the SQL that edits rows, run the server tests against Postgres and MySQL (and MariaDB if you touched MySQL), plus the engine you changed.
-5. If people will notice the change, add a line under the top section of `CHANGELOG.md`. Don't change the version in `Info.plist`; that happens when releasing.
-6. Open a pull request into `main` and fill in the template.
+5. If you change the data grid (`Sources/Base/DataGrid.swift`), run the scroll benchmark on a wide table before and after: `swift build -c release --product Base && .build/release/Base --demo --url=sqlite:///path/to/big.sqlite --open=<table> --bench`. It prints the main thread's work per frame; a 60 Hz screen leaves 16.7 ms. The grid paints its cells itself and has no view per cell or row: keep it that way.
+6. If people will notice the change, add a line under the top section of `CHANGELOG.md`. Don't change the version in `Info.plist`; that happens when releasing.
+7. Open a pull request into `main` and fill in the template.
 
 ## What a pull request needs before it's merged
 

@@ -498,7 +498,8 @@ final class WorkspaceWindowController: NSWindowController, NSWindowDelegate, NSM
         }
         showWindow(nil)
         window?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        // --background and the benchmark stay behind what you're working in.
+        if !Demo.staysBehind { NSApp.activate(ignoringOtherApps: true) }
         if CommandLine.arguments.contains("--demo") && Self.open.count == 1 { Demo.prepare(workspace) }
         DispatchQueue.main.async { for c in Self.open { c.refreshTabBar() } }
     }
