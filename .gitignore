@@ -1,6 +1,14 @@
+# macOS / Swift
 .build/
 build/
-dist/
-.DS_Store
 .swiftpm/
 *.xcodeproj/
+
+# Electron / Node
+node_modules/
+out/
+dist/
+
+# System
+.DS_Store
+*.local

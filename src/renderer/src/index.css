@@ -1,0 +1,63 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body, #root { height: 100%; margin: 0; }
+  body {
+    background: #1c1c1e;
+    color: #efefef;
+    font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+    font-size: 13px;
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden;
+  }
+  ::-webkit-scrollbar { width: 7px; height: 7px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.14); border-radius: 4px; }
+  ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.22); }
+  ::selection { background: rgba(59,130,246,0.35); }
+  input, textarea, select { font-family: inherit; font-size: inherit; }
+  input[type="password"] { font-family: "Cascadia Code", Consolas, monospace; }
+  button { cursor: pointer; }
+}
+
+@layer components {
+  .hairline { background: rgba(255,255,255,0.08); flex-shrink: 0; }
+  .hairline-h { height: 1px; }
+  .hairline-v { width: 1px; }
+
+  .mb-field {
+    @apply w-full rounded-md px-2.5 py-1.5 text-mb-text outline-none;
+    background: rgba(255,255,255,0.05);
+    border: 1px solid rgba(255,255,255,0.1);
+    transition: border-color 0.1s;
+  }
+  .mb-field:focus {
+    border-color: rgba(59,130,246,0.6);
+    background: rgba(255,255,255,0.07);
+  }
+  .mb-field::placeholder { color: #555; }
+  .mb-field.mono { font-family: "Cascadia Code", Consolas, monospace; font-size: 12px; }
+
+  .mb-btn {
+    @apply rounded-md px-3 py-1.5 text-sm font-medium transition-colors outline-none;
+    background: rgba(255,255,255,0.08);
+    border: 1px solid rgba(255,255,255,0.1);
+    color: #ccc;
+  }
+  .mb-btn:hover { background: rgba(255,255,255,0.12); color: #efefef; }
+  .mb-btn:active { background: rgba(255,255,255,0.06); }
+  .mb-btn:disabled { opacity: 0.4; cursor: default; }
+
+  .mb-btn-primary {
+    @apply rounded-md px-3 py-1.5 text-sm font-medium transition-colors outline-none;
+    background: #3b82f6;
+    border: 1px solid rgba(255,255,255,0.15);
+    color: white;
+  }
+  .mb-btn-primary:hover { background: #2563eb; }
+  .mb-btn-primary:active { background: #1d4ed8; }
+  .mb-btn-primary:disabled { opacity: 0.4; cursor: default; }
+}
