@@ -1,0 +1,68 @@
+{
+  "name": "maben-base",
+  "version": "0.1.0",
+  "description": "Maben Base — free database client for Windows",
+  "main": "out/main/index.js",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build && electron-builder",
+    "preview": "electron-vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "sql.js": "^1.12.0",
+    "mysql2": "^3.9.7",
+    "pg": "^8.11.5"
+  },
+  "devDependencies": {
+    "@codemirror/lang-sql": "^6.7.0",
+    "@codemirror/theme-one-dark": "^6.1.2",
+    "@electron-toolkit/preload": "^3.0.0",
+    "@electron-toolkit/utils": "^3.0.0",
+    "@types/sql.js": "^1.4.9",
+    "@types/pg": "^8.11.5",
+    "@types/react": "^18.3.1",
+    "@types/react-dom": "^18.3.0",
+    "@uiw/react-codemirror": "^4.21.25",
+    "@vitejs/plugin-react": "^4.2.1",
+    "autoprefixer": "^10.4.19",
+    "electron": "^30.0.4",
+    "electron-builder": "^24.13.3",
+    "electron-vite": "^2.1.0",
+    "postcss": "^8.4.38",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "tailwindcss": "^3.4.3",
+    "typescript": "^5.4.5",
+    "vite": "^5.2.11"
+  },
+  "build": {
+    "appId": "gg.maben.base",
+    "productName": "Maben Base",
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ],
+      "icon": "resources/icon.ico"
+    },
+    "mac": {
+      "target": "dmg"
+    },
+    "linux": {
+      "target": "AppImage"
+    },
+    "files": [
+      "out/**/*",
+      "resources/**/*"
+    ],
+    "extraMetadata": {
+      "main": "out/main/index.js"
+    }
+  },
+  "allowScripts": {
+    "electron@30.5.1": true,
+    "esbuild@0.21.5": true,
+    "fsevents@2.3.3": true
+  }
+}
