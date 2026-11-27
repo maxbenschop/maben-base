@@ -3,7 +3,7 @@
 Every release of Maben Base. The newest version is at the top. `publish.sh` uses the section for the version it
 releases as the GitHub release notes, and base.maben.gg/changelog is built from this file.
 
-## Unreleased
+## 0.2.3 · 27 November 2026
 
 Security fixes from a review of the whole app.
 
