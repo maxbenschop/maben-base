@@ -31,7 +31,7 @@ MongoDB collections show as tables with a column per top-level field, and the qu
 
 **Connections.** Saved connections in groups, with a colour tag (local, development, staging, production). Paste a URL (postgres://, mysql://, sqlserver://, mongodb+srv://, redis://, …) to fill in the form. Passwords, SSH passwords and certificate passwords go in your Keychain.
 - **SSH tunnels** through the system `ssh` (your `~/.ssh/config`, agent and jump hosts), with a key, a key with a passphrase, or a password.
-- **TLS:** off, prefer, require (any certificate) or verify, with your own CA file and a client certificate (.p12) when needed.
+- **TLS:** off, prefer, require (any certificate) or verify, with your own CA file and a client certificate (.p12) when needed. A new connection starts on verify for a server out on the internet and on prefer for this Mac and private networks. Prefer only goes on without encryption nearby; anywhere else it stops and says so. Engines reached over HTTPS always check the certificate unless you chose require.
 - **Unix sockets:** a host starting with `/` (Postgres socket directory or file, MySQL socket).
 - **Safe modes** per connection: off, ask before writes, ask before every query, Touch ID before writes, or read-only. Tagging a connection production turns on "ask before writes".
 - **Moving connections:** export them to a file (passwords encrypted with a passphrase if you include them) and import on another Mac, or import a list of URLs.
@@ -63,11 +63,11 @@ MongoDB collections show as tables with a column per top-level field, and the qu
 - Query results keep the first 50,000 rows by default (Settings: 200,000, 1,000,000 or all); **Load all** runs it again for every row.
 
 **Data.**
-- Export a table or a result as CSV, JSON, Excel, Markdown or SQL inserts. Export a whole database as one SQL file, an Excel workbook, or CSV or JSON per table.
+- Export a table or a result as CSV, JSON, Excel, Markdown or SQL inserts. Export a whole database as one SQL file, an Excel workbook, or CSV or JSON per table. CSV files have a "Protect against spreadsheet formulas" option (on until you turn it off): text that starts with =, +, - or @ gets an apostrophe in front, so a spreadsheet shows it instead of running it.
 - **Backup and restore** uses `pg_dump`/`pg_restore`/`psql` or `mysqldump`/`mysql` (MariaDB's own tools for MariaDB) when they're installed, and SQLite's `VACUUM INTO`.
 - **Import** a CSV into a table (by column name, in one transaction), or run a SQL file statement by statement.
 
-**Safety.** Production connections ask before saving edits, running statements that change data, or changing structure. Read-only connections never write.
+**Safety.** Production connections ask before saving edits, running statements that change data, or changing structure. Read-only connections never write: only statements the app knows to be reads run (anything it doesn't recognise counts as a write), and Postgres, MySQL, SQLite and DuckDB are also told to refuse writes themselves.
 
 **Look.** Light, dark or follow the system (View › Appearance).
 
@@ -84,22 +84,24 @@ swift test            # unit tests; see CONTRIBUTING.md for the tests against re
 
 `./release.sh` builds the universal, notarized download (`dist/Maben-Base.dmg` and `.zip`), and `./publish.sh` tags it, creates the GitHub release and deploys base.maben.gg. See `CONTRIBUTING.md`.
 
-Demo flags, for screenshots and trying things: `--demo --open=customers [--structure|--edit|--filter|--cells]`, `--demo --query="select 1" [--format|--explain]`, `--demo --palette`, `--demo --sheet=newTable|newView|backup|exportDatabase|snippets`, `--demo --appearance=light`, `--demo --connections`, `--demo --settings`, and `--demo --url=postgres://…` to try a real server without saving anything. `--demo --open=orders --bench` scrolls the grid and prints the work per frame (add `--url=` for a table of your own, or `--query="select …" --all` for every row of a result), and `--background` keeps a demo behind the window you're working in.
+Demo flags, for screenshots and trying things: `--demo --open=customers [--structure|--edit|--filter|--cells]`, `--demo --query="select 1" [--format|--explain]`, `--demo --palette`, `--demo --sheet=newTable|newView|backup|exportDatabase|snippets`, `--demo --appearance=light`, `--demo --connections`, `--demo --settings`, and `--demo --url=postgres://…` to try a real server without saving anything. `--url=`, `--also=` and `--query=` only work in a development build (`swift run`, `./build.sh demo`, or `.build/release/Base`); the released app ignores them. `--demo --open=orders --bench` scrolls the grid and prints the work per frame (add `--url=` for a table of your own, or `--query="select …" --all` for every row of a result), and `--background` keeps a demo behind the window you're working in.
 
 `base-tool` (`swift run BaseTool …`) runs SQL through the same drivers: `query <url> <sql>`, `schema <url>`, `ssh <user@host:port> <key|-> <url> <sql>`, and `format <sql>`.
 
-Data lives in `~/Library/Application Support/Maben Base/` (connections, history and saved queries as JSON). Passwords are in the Keychain under `gg.maben.base`.
+Data lives in `~/Library/Application Support/Maben Base/` (connections, history and saved queries as JSON; `tools.json` holds the path to sqlplus or duckdb when you set one, and never leaves this Mac). Passwords are in the Keychain under `gg.maben.base`, each tied to the host, port and user it was saved for.
 
 ## Updates
 
 The app updates itself from GitHub Releases (`Sources/Base/Updater.swift`), the same way Maben Awake and Maben Sweep do: at
 start, every 6 hours and after waking it asks the GitHub API for the latest release, downloads `Maben-Base.zip`, and only
-installs it if the app inside is signed with the Developer ID of team NJTYRVLSA8 with bundle ID `gg.maben.base`, accepted by
-Gatekeeper, and has the announced version. The old app goes to the Trash. An automatic install never restarts the app while
+installs it if the app inside is signed with the Developer ID of team NJTYRVLSA8 with bundle ID `gg.maben.base`, notarized by
+Apple, accepted by Gatekeeper, and has the announced version. The download only comes from this repository's releases on
+github.com. The new app is copied next to the old one, checked again there, and swapped in; the old app then goes to the
+Trash. Where the app folder needs an administrator password, root makes its own copy and runs the same checks on it. An automatic install never restarts the app while
 a connection window is open: it runs when none is open, or as you quit. The Update button in Settings installs at once (it
 asks first when edits are unsaved) and the open connections and tabs come back. Both switches (check, install) are on by
 default, in Settings under Updates (`UserDefaults` keys `updates.autoCheck` / `updates.autoInstall`). Apart from your
-databases, this is the only network request the app makes. `Base --verify-update <app> <version>` runs the same checks on
+databases, this is the only network request the app makes. In a development build, `Base --verify-update <app> <version>` runs the same checks on
 an app by hand.
 
 ## How it's built

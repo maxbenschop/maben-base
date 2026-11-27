@@ -5,7 +5,7 @@ Thanks for helping. This page explains how changes get from an idea into a relea
 ## How the code flows
 
 ```
-your fork / branch ──PR──▶ main ──release.sh──▶ tag vX.Y.Z + GitHub release
+your fork / branch ──PR──▶ main ──ship.sh──▶ tag vX.Y.Z + GitHub release
 ```
 
 - **`main`** is always releasable. Every change arrives through a pull request.
@@ -21,7 +21,7 @@ Found a bug or have an idea? Open an issue first if you're not sure it fits; sma
 3. Run `swift test`. The server tests are skipped unless you point them at real databases (below).
 4. If you change a driver or the SQL that edits rows, run the server tests against Postgres and MySQL (and MariaDB if you touched MySQL), plus the engine you changed.
 5. If you change the data grid (`Sources/Base/DataGrid.swift`), run the scroll benchmark on a wide table before and after: `swift build -c release --product Base && .build/release/Base --demo --url=sqlite:///path/to/big.sqlite --open=<table> --bench`. It prints the main thread's work per frame; a 60 Hz screen leaves 16.7 ms. The grid paints its cells itself and has no view per cell or row: keep it that way.
-6. If people will notice the change, add a line under the top section of `CHANGELOG.md`. Don't change the version in `Info.plist`; that happens when releasing.
+6. If people will notice the change, add a line under `## Unreleased` at the top of `CHANGELOG.md`. Don't change the version in `Info.plist`; that happens when releasing.
 7. Open a pull request into `main` and fill in the template.
 
 ## What a pull request needs before it's merged
@@ -69,7 +69,7 @@ swift test
 
 Cassandra needs the keyspace first: `swift run BaseTool query 'cassandra://127.0.0.1:59042/' "CREATE KEYSPACE mb WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}"`.
 
-Oracle runs through sqlplus. Without Instant Client on your Mac, point the driver at the container's: a script with `exec docker exec -i mb-oracle sqlplus "$@"`, then `MB_TEST_ORACLE='oracle://mb:Secret_pw_1@localhost:1521/FREEPDB1?tool=/path/to/that/script'`.
+Oracle runs through sqlplus. Without Instant Client on your Mac, point the driver at the container's: a script with `exec docker exec -i mb-oracle sqlplus "$@"`, then `MB_TEST_ORACLE='oracle://mb:Secret_pw_1@localhost:1521/FREEPDB1'` and `MB_TEST_ORACLE_TOOL=/path/to/that/script` (a URL can't name the tool: it never chooses a program to run; `base-tool` reads `MB_TOOL`).
 
 The tests create and drop their own tables. They browse, filter (number columns included) and save edits with awkward values through the same text the app writes; the Postgres and MySQL ones also check structure changes, the server window's SQL, rollback, cancel, and switching database.
 
@@ -81,13 +81,34 @@ TLS by hand: `swift run BaseTool query 'postgres://…?sslmode=verify-full&sslro
 - An UPDATE or DELETE that matches no row stops the save and rolls back.
 - Edits find rows by primary key only. Without one, the table is read-only.
 - Production connections ask first, and read-only connections never write.
-- A certificate is only skipped when the user chose TLS Require.
+- A certificate is only skipped when the user chose TLS Require (or Prefer, for the engines that are asked for TLS first). With TLS Verify it is checked before anything is sent.
+- A password the other end can read never goes out unencrypted, except to this Mac or a private network or with TLS Off.
+- What a server sends is never trusted to be well-formed: read through `ByteReader`, check lengths and counts, and throw instead of trapping.
+- A value from a database is never read back as a command: Redis and MongoDB edits go through `Driver.apply`, and nothing with a line break goes to sqlplus.
+- A URL, a connections file or the synced list never names a program to run (`ConnectionConfig.localToolPath` is set in the editor only).
 
 A change that touches one of these comes with a test that shows the rule still holds.
 
 ## Releasing (maintainer)
 
-Releases are tags `vX.Y.Z` on `main`. Add a section `## X.Y · <date>` to `CHANGELOG.md` and bump `CFBundleShortVersionString` in `Info.plist` first. `./release.sh` builds a universal app, signs it with the Developer ID and has Apple notarize it, then writes `dist/Maben-Base.dmg` and `.zip`. `./publish.sh` then tags the commit, creates the GitHub release with both files (notes from `CHANGELOG.md`) and rebuilds and deploys base.maben.gg. Installed copies see the release within 6 hours and update themselves, so only publish what you would install yourself.
+One command, from an up-to-date checkout with everything that should go out in the working tree or on `main`:
+
+```sh
+./ship.sh --check        # shows the version, the notes and what will be committed; changes nothing
+./ship.sh                # the next patch version; or: ./ship.sh minor | major | X.Y.Z
+```
+
+It sets the version in `Info.plist` (`0.2.3` for fixes, `0.3` for features), turns `## Unreleased` in `CHANGELOG.md` into
+`## <version> · <date>`, runs the tests, opens the pull request and merges it when **Build and test** passes,
+runs `./release.sh` (universal build, Developer ID, Apple's notarization) and `./publish.sh` (tag `vX.Y.Z`,
+GitHub release with `Maben-Base.dmg` and `Maben-Base.zip`, base.maben.gg), and at the end downloads the
+published zip and checks it the way an installed copy does. After a failure, fix the cause and run it again.
+
+It needs no passwords: Xcode's signed-in Apple account signs and notarizes, and `gh` is logged in. A published
+release can't be changed (releases are immutable), so a mistake is fixed with the next version.
+
+Installed copies see the release within 6 hours, verify the Developer ID signature and Apple's notarization,
+and update themselves, so only release what you would install yourself.
 
 ## Style
 

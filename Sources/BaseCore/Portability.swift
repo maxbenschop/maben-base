@@ -42,8 +42,11 @@ public enum ConnectionMerge {
     public static func merge(local: [ConnectionConfig], remote: [ConnectionConfig], deleted: [UUID: Date]) -> [ConnectionConfig] {
         var byID: [UUID: ConnectionConfig] = [:]
         for c in local { byID[c.id] = c }
-        for c in remote {
+        // A connection with a line break or another control character in a field never comes in from the shared file.
+        for var c in remote where c.isWellFormed {
             if let mine = byID[c.id], mine.modified >= c.modified { continue }
+            // The tool's path is this Mac's own setting: the other copy never has one, and never sets it.
+            c.localToolPath = byID[c.id]?.localToolPath ?? ""
             byID[c.id] = c
         }
         let kept = byID.values.filter { c in deleted[c.id].map { $0 < c.modified } ?? true }

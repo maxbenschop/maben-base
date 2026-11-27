@@ -20,7 +20,8 @@ public indirect enum BSON: Equatable {
         switch self {
         case .int32(let v): Int(v)
         case .int64(let v): Int(v)
-        case .double(let v): Int(v)
+        // NaN, infinity and numbers past Int's range have no Int; asking for one anyway would stop the app.
+        case .double(let v): Int(exactly: v.rounded(.towardZero))
         default: nil
         }
     }
@@ -88,12 +89,15 @@ public indirect enum BSON: Equatable {
 
     // Decoding
 
-    static func decode(_ bytes: [UInt8], at start: Int = 0) throws -> (BSON, Int) {
+    static func decode(_ bytes: [UInt8], at start: Int = 0, depth: Int = 0) throws -> (BSON, Int) {
+        // MongoDB itself stops at 100 levels; a document nested without end would run the app out of stack.
+        guard depth <= 200 else { throw DatabaseError("MongoDB sent a document nested too deep to read.") }
+        guard start >= 0, start <= bytes.count - 5 else { throw DatabaseError("MongoDB sent a malformed document.") }
         var r = ByteReader(bytes)
         r.pos = start
         let length = Int(Int32(truncatingIfNeeded: r.intLE(4)))
+        guard length >= 5, length <= bytes.count - start else { throw DatabaseError("MongoDB sent a malformed document.") }
         let end = start + length
-        guard length >= 5, end <= bytes.count else { throw DatabaseError("MongoDB sent a malformed document.") }
         var fields: [(String, BSON)] = []
         while r.pos < end - 1 {
             let type = r.byte()
@@ -105,7 +109,7 @@ public indirect enum BSON: Equatable {
                 let n = Int(Int32(truncatingIfNeeded: r.intLE(4)))
                 value = .string(String(decoding: r.take(n - 1), as: UTF8.self)); _ = r.byte()
             case 0x03, 0x04:
-                let (doc, len) = try decode(bytes, at: r.pos)
+                let (doc, len) = try decode(bytes, at: r.pos, depth: depth + 1)
                 r.pos += len
                 value = type == 0x03 ? doc : .array(doc.fields.map(\.1))
             case 0x05:
@@ -174,8 +178,10 @@ public indirect enum BSON: Equatable {
 
     /// Decimal128 to text (enough for normal values; NaN/Infinity aside).
     static func decimalString(_ d: Data) -> String {
-        let low = d.withUnsafeBytes { $0.load(fromByteOffset: 0, as: UInt64.self) }.littleEndian
-        let high = d.withUnsafeBytes { $0.load(fromByteOffset: 8, as: UInt64.self) }.littleEndian
+        // Sixteen bytes, low half first. A shorter value (a cut-off reply) reads as zeros, never past its end.
+        let b = Array(d.prefix(16)) + [UInt8](repeating: 0, count: max(0, 16 - d.count))
+        func word(_ at: Int) -> UInt64 { (0..<8).reduce(UInt64(0)) { $0 | UInt64(b[at + $1]) << (8 * UInt64($1)) } }
+        let low = word(0), high = word(8)
         let negative = high >> 63 == 1
         let exponent = Int((high >> 49) & 0x3FFF) - 6176
         let coeffHigh = high & 0x1FFFF_FFFF_FFFF
@@ -221,6 +227,8 @@ public enum MongoText {
     struct Parser {
         let chars: [Character]
         var i = 0
+        /// How deep the value being read is nested: text nested without end would run the app out of stack.
+        private var depth = 0
         init(_ s: String) { chars = Array(s) }
 
         mutating func skip() {
@@ -274,6 +282,9 @@ public enum MongoText {
         }
 
         mutating func value() throws -> BSON {
+            depth += 1
+            defer { depth -= 1 }
+            guard depth <= 200 else { throw DatabaseError("The value is nested too deep.") }
             guard let c = peek() else { throw DatabaseError("Expected a value.") }
             switch c {
             case "{":
@@ -360,7 +371,9 @@ public enum MongoText {
                 guard let text else { return .date(Int64(Date().timeIntervalSince1970 * 1000)) }
                 return .date(Int64((try MongoText.date(text)).timeIntervalSince1970 * 1000))
             case "NumberLong": return .int64(args.first?.int.map(Int64.init) ?? Int64(text ?? "") ?? 0)
-            case "NumberInt": return .int32(Int32(args.first?.int ?? Int(text ?? "") ?? 0))
+            case "NumberInt":
+                guard let n = Int32(exactly: args.first?.int ?? Int(text ?? "") ?? 0) else { throw DatabaseError("NumberInt needs a number between \(Int32.min) and \(Int32.max).") }
+                return .int32(n)
             case "NumberDecimal", "Decimal128":
                 guard let text, let d = Decimal(string: text) else { throw DatabaseError("NumberDecimal needs a number in quotes.") }
                 return .double(NSDecimalNumber(decimal: d).doubleValue)
@@ -368,12 +381,15 @@ public enum MongoText {
                 guard let text, let u = UUID(uuidString: text) else { throw DatabaseError("UUID needs a UUID in quotes.") }
                 return .binary(4, withUnsafeBytes(of: u.uuid) { Data($0) })
             case "BinData":
-                guard args.count == 2, let sub = args[0].int, let b64 = args[1].stringValue, let d = Data(base64Encoded: b64) else {
-                    throw DatabaseError("BinData needs a subtype and base64 text.")
+                guard args.count == 2, let sub = args[0].int.flatMap(UInt8.init(exactly:)), let b64 = args[1].stringValue, let d = Data(base64Encoded: b64) else {
+                    throw DatabaseError("BinData needs a subtype from 0 to 255 and base64 text.")
                 }
-                return .binary(UInt8(sub), d)
+                return .binary(sub, d)
             case "Timestamp":
-                return .timestamp(UInt64(args.first?.int ?? 0) << 32 | UInt64(args.count > 1 ? args[1].int ?? 0 : 0))
+                guard let t = UInt32(exactly: args.first?.int ?? 0), let n = UInt32(exactly: args.count > 1 ? args[1].int ?? 0 : 0) else {
+                    throw DatabaseError("Timestamp needs two numbers from 0 to \(UInt32.max).")
+                }
+                return .timestamp(UInt64(t) << 32 | UInt64(n))
             default:
                 throw DatabaseError("\(name)() isn't something this app knows.")
             }
@@ -415,9 +431,33 @@ public enum MongoText {
 
     static func literal(_ text: String, type: String? = nil) -> String { value(text, type: type).shell }
 
+    // _id: the one value the app reads back from a cell to find a document again.
+
+    /// How an _id shows in its cell, written so that `idValue` reads back exactly the value it was: a string
+    /// that would read as shell syntax ('{ $ne: null }', 'ObjectId("…")', '5') is shown in quotes; everything
+    /// else as in any other cell.
+    static func idCell(_ id: BSON) -> String? {
+        guard case .string(let s) = id else { return id.cell }
+        return (try? parse(s.trimmingCharacters(in: .whitespacesAndNewlines))) == nil ? s : jsonString(s)
+    }
+
+    /// The value an _id cell stands for: the inverse of `idCell`. Text that isn't shell syntax is that string.
+    static func idValue(_ cell: String) -> BSON {
+        (try? parse(cell.trimmingCharacters(in: .whitespacesAndNewlines))) ?? .string(cell)
+    }
+
+    /// The filter that finds one document by its _id. A document (or anything else that could be read as
+    /// query operators) is compared as a value with $eq, never run as a query.
+    static func idFilter(_ id: BSON) -> BSON {
+        switch id {
+        case .document, .array, .regex: .document([("_id", .document([("$eq", id)]))])
+        default: .document([("_id", id)])
+        }
+    }
+
     // Commands the app writes.
 
-    static func collection(_ table: TableRef) -> String { "db.getCollection(\(jsonString(table.name)))" }
+    public static func collection(_ table: TableRef) -> String { "db.getCollection(\(jsonString(table.name)))" }
 
     static func filter(_ filters: [Filter], types: [String: String] = [:]) -> String? {
         var parts: [String] = []
@@ -461,35 +501,131 @@ public enum MongoText {
 
     static func count(_ table: TableRef, filter: String?) -> String { "\(collection(table)).countDocuments(\(filter ?? "{}"))" }
 
-    /// Edits as updateOne / deleteOne / insertOne, found by _id.
-    static func statements(for changes: ChangeSet, table: TableRef, columns: [ResultColumn]) throws -> [String] {
+    /// One staged edit as the values a command is made of.
+    enum Edit {
+        case delete(filter: BSON)
+        case update(filter: BSON, set: BSON)
+        case insert(BSON)
+    }
+
+    /// Edits as values, found by _id. The driver sends these as they are; `statements` shows them as text.
+    static func edits(for changes: ChangeSet, columns: [ResultColumn]) throws -> [Edit] {
         guard let idIndex = columns.firstIndex(where: { $0.name == "_id" }) else {
             throw DatabaseError("Documents are found by _id, which isn't in this result.")
         }
-        let c = collection(table)
-        func idFilter(_ original: [String?]) throws -> String {
-            guard let id = original[idIndex] else { throw DatabaseError("A document without _id can't be changed here.") }
-            return "{ _id: \(literal(id, type: columns[idIndex].typeName)) }"
+        func filter(_ original: [String?]) throws -> BSON {
+            guard let id = original[safe: idIndex] ?? nil else { throw DatabaseError("A document without _id can't be changed here.") }
+            return idFilter(idValue(id))
         }
-        var out: [String] = []
+        var out: [Edit] = []
         for row in changes.deletes.sorted() {
             guard let original = changes.originals[row] else { continue }
-            out.append("\(c).deleteOne(\(try idFilter(original)))")
+            out.append(.delete(filter: try filter(original)))
         }
         for row in changes.updates.keys.sorted() where !changes.deletes.contains(row) {
             guard let original = changes.originals[row], let edits = changes.updates[row], !edits.isEmpty else { continue }
             if edits[idIndex] != nil { throw DatabaseError("_id can't be changed; duplicate the document and delete the old one instead.") }
-            let sets = edits.keys.sorted().map { i in "\(key(columns[i].name)): \(edits[i]!.map { literal($0, type: columns[i].typeName) } ?? "null")" }
-            out.append("\(c).updateOne(\(try idFilter(original)), { $set: { \(sets.joined(separator: ", ")) } })")
+            let sets = edits.keys.sorted().filter(columns.indices.contains).map { i in
+                (columns[i].name, edits[i]!.map { value($0, type: columns[i].typeName) } ?? .null)
+            }
+            out.append(.update(filter: try filter(original), set: .document([("$set", .document(sets))])))
         }
         for insert in changes.inserts {
-            let fields = insert.values.keys.sorted().compactMap { i -> String? in
+            let fields = insert.values.keys.sorted().filter(columns.indices.contains).compactMap { i -> (String, BSON)? in
                 guard let v = insert.values[i] ?? nil else { return nil }
-                return "\(key(columns[i].name)): \(literal(v, type: columns[i].typeName))"
+                return (columns[i].name, value(v, type: columns[i].typeName))
             }
-            out.append("\(c).insertOne({ \(fields.joined(separator: ", ")) })")
+            out.append(.insert(.document(fields)))
         }
         return out
+    }
+
+    /// Edits as updateOne / deleteOne / insertOne text, to show before saving and to keep in the history.
+    static func statements(for changes: ChangeSet, table: TableRef, columns: [ResultColumn]) throws -> [String] {
+        let c = collection(table)
+        return try edits(for: changes, columns: columns).map { edit in
+            switch edit {
+            case .delete(let filter): "\(c).deleteOne(\(filter.shell))"
+            case .update(let filter, let set): "\(c).updateOne(\(filter.shell), \(set.shell))"
+            case .insert(let document): "\(c).insertOne(\(document.shell))"
+            }
+        }
+    }
+
+    struct Call { var name: String; var args: [BSON] }
+
+    /// db.<collection>.<method>(…).<method>(…) or db.<method>(…), as the collection and the calls on it.
+    static func parseCommand(_ text: String) throws -> (collection: String?, calls: [Call]) {
+        var p = Parser(text)
+        guard p.identifier() == "db" else { throw DatabaseError("Commands start with db., show dbs, show collections or use <database>.") }
+        var collection: String?
+        var calls: [Call] = []
+        while let c = p.peek() {
+            if c == "." {
+                p.i += 1
+                let name = p.identifier()
+                if p.peek() == "(" {
+                    p.i += 1
+                    var args: [BSON] = []
+                    while p.peek() != ")" {
+                        args.append(try p.value())
+                        if p.peek() == "," { p.i += 1 } else { break }
+                    }
+                    try p.expect(")")
+                    if name == "getCollection", calls.isEmpty, collection == nil { collection = args.first?.stringValue; continue }
+                    calls.append(Call(name: name, args: args))
+                } else if collection == nil && calls.isEmpty {
+                    collection = name
+                } else {
+                    throw DatabaseError("Expected ( after \(name).")
+                }
+            } else if c == "[" {
+                p.i += 1
+                guard case .string(let name) = try p.value() else { throw DatabaseError("Expected a collection name in [\"…\"].") }
+                try p.expect("]")
+                collection = name
+            } else {
+                throw DatabaseError("Unexpected \(c) at position \(p.i + 1).")
+            }
+        }
+        return (collection, calls)
+    }
+
+    // Read-only: only what is known to read.
+
+    private static let readingMethods: Set<String> = ["find", "findOne", "countDocuments", "count", "estimatedDocumentCount", "distinct", "getIndexes", "aggregate"]
+    private static let readingCommands: Set<String> = [
+        "find", "count", "distinct", "aggregate", "listCollections", "listIndexes", "listDatabases", "ping", "hello", "isMaster", "ismaster",
+        "buildInfo", "buildinfo", "serverStatus", "dbStats", "dbstats", "collStats", "collstats", "connectionStatus", "hostInfo", "usersInfo", "rolesInfo",
+    ]
+
+    /// $out and $merge make an aggregation write. They are looked for at any depth: a miss here would let a write through.
+    private static func writesInPipeline(_ value: BSON) -> Bool {
+        switch value {
+        case .document(let fields): fields.contains { $0.0 == "$out" || $0.0 == "$merge" || writesInPipeline($0.1) }
+        case .array(let items): items.contains(where: writesInPipeline)
+        default: false
+        }
+    }
+
+    /// True when every command in the text is one that only reads. Anything the app doesn't know, or can't
+    /// read, counts as a write, so a read-only connection refuses it.
+    static func isReadOnly(_ text: String) -> Bool {
+        commands(text).allSatisfy { command in
+            let lower = command.lowercased()
+            if ["show dbs", "show databases", "show collections", "show tables"].contains(lower) || lower.hasPrefix("use ") { return true }
+            guard let (collection, calls) = try? parseCommand(command), let first = calls.first else { return false }
+            if collection != nil {
+                return readingMethods.contains(first.name) && !first.args.contains(where: writesInPipeline)
+            }
+            switch first.name {
+            case "getCollectionNames", "getName": return true
+            case "runCommand", "adminCommand":
+                guard let name = first.args.first?.fields.first?.0 else { return false }
+                return readingCommands.contains(name) && !first.args.contains(where: writesInPipeline)
+            default: return false
+            }
+        }
     }
 
     // Splitting a script into commands: on ; and on new lines that start a new command, outside brackets.
@@ -565,9 +701,10 @@ public final class MongoDriver: Driver {
     private let port: Int
 
     public init(host: String, port: Int, user: String, password: String, database: String, tls: TLSOptions, options: [String: String]) throws {
-        var hosts: [(String, Int)] = host.split(separator: ",").map { part in
+        var hosts: [(String, Int)] = host.split(separator: ",").compactMap { part in
             let p = part.split(separator: ":")
-            return (String(p[0]), p.count > 1 ? Int(p[1]) ?? port : port)
+            guard let name = p.first else { return nil }
+            return (String(name), p.count > 1 ? Int(p[1]) ?? port : port)
         }
         var authSource = options["authSource"] ?? (database.isEmpty ? "admin" : database)
         if options["srv"] == "1", let first = hosts.first {
@@ -583,7 +720,8 @@ public final class MongoDriver: Driver {
         for (h, p) in hosts {
             do {
                 let s = try Socket(host: h, port: p)
-                if tls.mode != .off { s.startTLS(tls) }
+                // The handshake runs here, and with TLS Verify the certificate is checked here: before anything is sent.
+                if tls.mode != .off { try s.startTLS(tls) }
                 socket = s
                 let hello = try Self.command(s, [("hello", .int32(1)), ("$db", .string("admin"))], &requestID)
                 if hello["isWritablePrimary"] == .bool(true) || hello["ismaster"] == .bool(true) || hosts.count == 1 {
@@ -627,6 +765,8 @@ public final class MongoDriver: Driver {
         let length = Int(header.intLE(4))
         _ = header.intLE(8)
         let opcode = header.intLE(4)
+        // MongoDB stops a message at 48 MB.
+        guard length >= 16 + 5, length <= 256 << 20 else { throw DatabaseError.malformedReply("A message of \(length) bytes.") }
         let payload = try socket.read(length - 16)
         guard opcode == 2013 else { throw DatabaseError("MongoDB answered with an old message type (\(opcode)); it needs to be 3.6 or newer.") }
         var r = ByteReader(payload)
@@ -674,14 +814,14 @@ public final class MongoDriver: Driver {
         let proof: [UInt8]
         let serverSignature: [UInt8]
         if sha1 {
-            let salted = Self.pbkdf2SHA1(Array(secret.utf8), salt: Array(salt), iterations: i)
+            let salted = try Self.pbkdf2SHA1(Array(secret.utf8), salt: Array(salt), iterations: i)
             let clientKey = Array(HMAC<Insecure.SHA1>.authenticationCode(for: Array("Client Key".utf8), using: SymmetricKey(data: salted)))
             let stored = Array(Insecure.SHA1.hash(data: clientKey))
             proof = Crypto.xor(clientKey, Array(HMAC<Insecure.SHA1>.authenticationCode(for: auth, using: SymmetricKey(data: stored))))
             let serverKey = Array(HMAC<Insecure.SHA1>.authenticationCode(for: Array("Server Key".utf8), using: SymmetricKey(data: salted)))
             serverSignature = Array(HMAC<Insecure.SHA1>.authenticationCode(for: auth, using: SymmetricKey(data: serverKey)))
         } else {
-            let salted = Crypto.pbkdf2SHA256(password: Array(secret.utf8), salt: Array(salt), iterations: i)
+            let salted = try Crypto.pbkdf2SHA256(password: Array(secret.utf8), salt: Array(salt), iterations: i)
             let clientKey = Crypto.hmacSHA256(key: salted, Array("Client Key".utf8))
             proof = Crypto.xor(clientKey, Crypto.hmacSHA256(key: Crypto.sha256(clientKey), auth))
             serverSignature = Crypto.hmacSHA256(key: Crypto.hmacSHA256(key: salted, Array("Server Key".utf8)), auth)
@@ -695,12 +835,19 @@ public final class MongoDriver: Driver {
                 throw DatabaseError("MongoDB's sign-in signature didn't match.")
             }
         }
+        // A server that never says it's done doesn't get to keep the app asking.
+        var rounds = 0
         while reply["done"] != .bool(true) {
+            rounds += 1
+            guard rounds <= 8 else { throw DatabaseError("MongoDB didn't finish the sign-in.") }
             reply = try run([("saslContinue", .int32(1)), ("conversationId", conversation), ("payload", .binary(0, Data()))], db: authSource)
         }
     }
 
-    static func pbkdf2SHA1(_ password: [UInt8], salt: [UInt8], iterations: Int) -> [UInt8] {
+    static func pbkdf2SHA1(_ password: [UInt8], salt: [UInt8], iterations: Int) throws -> [UInt8] {
+        guard (1...Crypto.maxPBKDF2Rounds).contains(iterations) else {
+            throw DatabaseError.malformedReply("The sign-in asks for \(iterations) rounds of password hashing.")
+        }
         // PBKDF2 with HMAC-SHA1, one 20-byte block.
         let key = SymmetricKey(data: password)
         var u = Array(HMAC<Insecure.SHA1>.authenticationCode(for: salt + [0, 0, 0, 1], using: key))
@@ -727,16 +874,40 @@ public final class MongoDriver: Driver {
         return String(decoding: data, as: UTF8.self).split(whereSeparator: \.isNewline).map(String.init)
     }
 
+    /// A host name as DNS has them: letters, digits, dots and hyphens. Anything else isn't looked up, since
+    /// dig would read "@server" or "+option" as its own arguments.
+    static func isHostName(_ host: String) -> Bool {
+        !host.isEmpty && host.count <= 253 && !host.hasPrefix("-") && !host.hasPrefix(".")
+            && host.unicodeScalars.allSatisfy { $0.isASCII && (CharacterSet.alphanumerics.contains($0) || $0 == "." || $0 == "-" || $0 == "_") }
+    }
+
+    /// MongoDB's rule for mongodb+srv: a server the DNS answer names must be in the same domain as the name
+    /// you asked for (the name without its first label), so a forged or careless DNS record can't send the
+    /// connection, and your sign-in, somewhere else. A name of one or two labels must be the whole ending.
+    static func srvTargetAllowed(_ target: String, for host: String) -> Bool {
+        let t = target.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
+        let h = host.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
+        let labels = h.split(separator: ".")
+        let parent = labels.count >= 3 ? labels.dropFirst().joined(separator: ".") : h
+        return isHostName(t) && t.hasSuffix("." + parent)
+    }
+
     static func lookupSRV(_ host: String) throws -> [(String, Int)] {
-        dig(["SRV", "_mongodb._tcp.\(host)"]).compactMap { line in
+        guard isHostName(host) else { throw DatabaseError("\(host) isn't a host name that can be looked up.") }
+        let found: [(String, Int)] = dig(["SRV", "_mongodb._tcp.\(host)"]).compactMap { line in
             let p = line.split(separator: " ")
-            guard p.count == 4, let port = Int(p[2]) else { return nil }
+            guard p.count == 4, let port = Int(p[2]), (1...65535).contains(port) else { return nil }
             return (String(p[3]).trimmingCharacters(in: CharacterSet(charactersIn: ".")), port)
         }
+        if let stray = found.first(where: { !srvTargetAllowed($0.0, for: host) }) {
+            throw DatabaseError("The DNS answer for \(host) names a server outside its domain.",
+                                detail: "\(stray.0) isn't under \(host.split(separator: ".").dropFirst().joined(separator: ".")). Nothing was sent.")
+        }
+        return found
     }
 
     static func lookupTXT(_ host: String) -> [String: String]? {
-        guard let line = dig(["TXT", host]).first else { return nil }
+        guard isHostName(host), let line = dig(["TXT", host]).first else { return nil }
         var out: [String: String] = [:]
         for pair in line.trimmingCharacters(in: CharacterSet(charactersIn: "\"")).split(separator: "&") {
             let kv = pair.split(separator: "=", maxSplits: 1)
@@ -766,7 +937,8 @@ public final class MongoDriver: Driver {
         let columns = names.map { n in
             ResultColumn(name: n, typeName: types[n]?.filter { $0.key != "null" }.max { $0.value < $1.value }?.key ?? "null", isBinary: false)
         }
-        let rows = docs.map { d in names.map { d[$0]?.cell } }
+        // _id is read back to find the document again, so its cell is written to round-trip exactly.
+        let rows = docs.map { d in names.map { n in n == "_id" ? d[n].flatMap(MongoText.idCell) : d[n]?.cell } }
         return QueryResult(columns: columns, rows: rows, message: "\(rows.count) document\(rows.count == 1 ? "" : "s")", truncated: truncated)
     }
 
@@ -776,9 +948,13 @@ public final class MongoDriver: Driver {
         var id = cursor["id"] ?? .int64(0)
         let ns = cursor["ns"]?.stringValue ?? ""
         let collection = ns.split(separator: ".", maxSplits: 1).last.map(String.init) ?? ""
-        while (id.int ?? 0) != 0 && docs.count < limit {
+        // A cursor that stays open while handing over nothing would keep the app asking without end.
+        var empty = 0
+        while (id.int ?? 0) != 0 && docs.count < limit && empty < 100 {
             let more = try run([("getMore", id), ("collection", .string(collection))])
-            docs += more["cursor"]?["nextBatch"]?.arrayValue ?? []
+            let batch = more["cursor"]?["nextBatch"]?.arrayValue ?? []
+            empty = batch.isEmpty ? empty + 1 : 0
+            docs += batch
             id = more["cursor"]?["id"] ?? .int64(0)
         }
         if (id.int ?? 0) != 0 { _ = try? run([("killCursors", .string(collection)), ("cursors", .array([id]))]) }
@@ -799,7 +975,7 @@ public final class MongoDriver: Driver {
         return results
     }
 
-    private struct Call { var name: String; var args: [BSON] }
+    private typealias Call = MongoText.Call
 
     private func executeOne(_ text: String, rowLimit: Int) throws -> QueryResult {
         let lower = text.lowercased()
@@ -814,39 +990,7 @@ public final class MongoDriver: Driver {
             try use(database: name)
             return QueryResult(message: "switched to db \(name)")
         }
-        // db.<collection>.<method>(…).<method>(…) or db.<method>(…)
-        var p = MongoText.Parser(text)
-        guard p.identifier() == "db" else { throw DatabaseError("Commands start with db., show dbs, show collections or use <database>.") }
-        var collection: String?
-        var calls: [Call] = []
-        while let c = p.peek() {
-            if c == "." {
-                p.i += 1
-                let name = p.identifier()
-                if p.peek() == "(" {
-                    p.i += 1
-                    var args: [BSON] = []
-                    while p.peek() != ")" {
-                        args.append(try p.value())
-                        if p.peek() == "," { p.i += 1 } else { break }
-                    }
-                    try p.expect(")")
-                    if name == "getCollection", calls.isEmpty, collection == nil { collection = args.first?.stringValue; continue }
-                    calls.append(Call(name: name, args: args))
-                } else if collection == nil && calls.isEmpty {
-                    collection = name
-                } else {
-                    throw DatabaseError("Expected ( after \(name).")
-                }
-            } else if c == "[" {
-                p.i += 1
-                guard case .string(let name) = try p.value() else { throw DatabaseError("Expected a collection name in [\"…\"].") }
-                try p.expect("]")
-                collection = name
-            } else {
-                throw DatabaseError("Unexpected \(c) at position \(p.i + 1).")
-            }
-        }
+        let (collection, calls) = try MongoText.parseCommand(text)
         guard let first = calls.first else { throw DatabaseError("Nothing to run: add a method like .find().") }
         if let collection { return try collectionCall(collection, first, Array(calls.dropFirst()), rowLimit: rowLimit) }
         return try databaseCall(first, rowLimit: rowLimit)
@@ -958,6 +1102,27 @@ public final class MongoDriver: Driver {
             return QueryResult(message: "Renamed to \(to)")
         default:
             throw DatabaseError(".\(call.name)() isn't supported here; use db.runCommand({ … }).")
+        }
+    }
+
+    /// Saves edits as commands built from the values themselves. The _id that finds each document is the
+    /// value its cell stands for, compared as a value: it is never read as a query.
+    public func apply(_ changes: ChangeSet, table: TableRef, columns: [ResultColumn], primaryKey: [String]) throws {
+        let c = BSON.string(table.name)
+        func found(_ reply: BSON, _ text: @autoclosure () -> String) throws {
+            guard reply["n"]?.int == 0 else { return }
+            throw DatabaseError("A row wasn't found any more, so nothing was saved.",
+                                detail: "Someone may have changed or removed it. Refresh and try again.\n\n\(text())")
+        }
+        for edit in try MongoText.edits(for: changes, columns: columns) {
+            switch edit {
+            case .delete(let filter):
+                try found(try run([("delete", c), ("deletes", .array([.document([("q", filter), ("limit", .int32(1))])]))]), filter.shell)
+            case .update(let filter, let set):
+                try found(try run([("update", c), ("updates", .array([.document([("q", filter), ("u", set), ("multi", .bool(false))])]))]), filter.shell)
+            case .insert(let document):
+                try run([("insert", c), ("documents", .array([document]))])
+            }
         }
     }
 

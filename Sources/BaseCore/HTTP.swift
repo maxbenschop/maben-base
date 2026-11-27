@@ -1,14 +1,30 @@
 import Foundation
 
 /// A blocking HTTPS client for the engines reached over HTTP (ClickHouse, libSQL, D1, Snowflake, BigQuery),
-/// with the same TLS choices as the socket drivers, and a cancel that stops the request in flight.
-final class HTTPClient: NSObject, URLSessionDelegate, @unchecked Sendable {
+/// with a cancel that stops the request in flight. The server's certificate is always checked, against this
+/// Mac's trusted roots or your own CA, unless the connection is set to TLS Require: a token or password
+/// never goes to a server that could be anyone by default.
+final class HTTPClient: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    /// The largest answer kept. A server can't make the app hold more than this.
+    static let maxBody = Socket.maxMessage
+
     private var session: URLSession!
     private let tls: TLSOptions
     private let host: String
     private let lock = NSLock()
     private var current: URLSessionTask?
+    private var pending: [Int: Pending] = [:]
     var timeout: TimeInterval = 600
+
+    private struct Pending {
+        var body = Data()
+        var error: Error?
+        var response: URLResponse?
+        var tooLarge = false
+        /// Why the server's certificate was refused, when it was.
+        var distrust: String?
+        let done = DispatchSemaphore(value: 0)
+    }
 
     init(tls: TLSOptions, host: String) {
         self.tls = tls
@@ -32,25 +48,30 @@ final class HTTPClient: NSObject, URLSessionDelegate, @unchecked Sendable {
         request.httpMethod = method
         for (k, v) in headers { request.setValue(v, forHTTPHeaderField: k) }
         request.httpBody = body
-        let done = DispatchSemaphore(value: 0)
-        var result: Result<Response, Error> = .failure(DatabaseError("No response."))
-        let task = session.dataTask(with: request) { data, response, error in
-            if let error {
-                let ns = error as NSError
-                result = .failure(ns.code == NSURLErrorCancelled ? DatabaseError("Stopped.") :
-                                    DatabaseError("Couldn't reach \(url.host ?? "the server").", detail: error.localizedDescription))
-            } else if let http = response as? HTTPURLResponse {
-                var h: [String: String] = [:]
-                for (k, v) in http.allHeaderFields { h[String(describing: k).lowercased()] = String(describing: v) }
-                result = .success(Response(status: http.statusCode, headers: h, body: data ?? Data()))
-            }
-            done.signal()
-        }
-        lock.lock(); current = task; lock.unlock()
+        let task = session.dataTask(with: request)
+        let waiting = Pending()
+        lock.lock(); pending[task.taskIdentifier] = waiting; current = task; lock.unlock()
         task.resume()
-        done.wait()
-        lock.lock(); current = nil; lock.unlock()
-        return try result.get()
+        waiting.done.wait()
+        lock.lock()
+        let result = pending.removeValue(forKey: task.taskIdentifier) ?? waiting
+        current = nil
+        lock.unlock()
+        let name = url.host ?? "the server"
+        if result.tooLarge { throw DatabaseError.malformedReply("An answer of more than \(Self.maxBody) bytes.") }
+        if let reason = result.distrust { throw TLSTrust.error(host: tls.peerName ?? name, reason: reason) }
+        if let error = result.error {
+            let code = (error as NSError).code
+            if code == NSURLErrorCancelled { throw DatabaseError("Stopped.") }
+            if (NSURLErrorClientCertificateRejected...NSURLErrorServerCertificateUntrusted).contains(code) || code == NSURLErrorSecureConnectionFailed {
+                throw TLSTrust.error(host: name, reason: error.localizedDescription)
+            }
+            throw DatabaseError("Couldn't reach \(name).", detail: error.localizedDescription)
+        }
+        guard let http = result.response as? HTTPURLResponse else { throw DatabaseError("No response.") }
+        var h: [String: String] = [:]
+        for (k, v) in http.allHeaderFields { h[String(describing: k).lowercased()] = String(describing: v) }
+        return Response(status: http.statusCode, headers: h, body: result.body)
     }
 
     func json(_ url: URL, method: String = "POST", headers: [String: String] = [:], body: Any? = nil) throws -> (Int, Any?) {
@@ -71,21 +92,52 @@ final class HTTPClient: NSObject, URLSessionDelegate, @unchecked Sendable {
 
     func close() { session.invalidateAndCancel() }
 
-    // TLS: Require accepts any certificate; Verify checks it (against your CA when one is set); a client
-    // certificate is offered when the server asks for one.
-    func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge,
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        lock.lock(); defer { lock.unlock() }
+        guard var p = pending[dataTask.taskIdentifier] else { return }
+        if p.body.count + data.count > Self.maxBody {
+            p.tooLarge = true
+            dataTask.cancel()
+        } else {
+            p.body.append(data)
+        }
+        pending[dataTask.taskIdentifier] = p
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        lock.lock()
+        pending[task.taskIdentifier]?.error = error
+        pending[task.taskIdentifier]?.response = task.response
+        let done = pending[task.taskIdentifier]?.done
+        lock.unlock()
+        done?.signal()
+    }
+
+    /// A redirect is followed only to the same server over HTTPS (or within this Mac and private networks):
+    /// the request carries the password or token in its headers, and they must not follow a redirect elsewhere.
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
+        let from = task.originalRequest?.url, to = request.url
+        let sameServer = from?.host?.lowercased() == to?.host?.lowercased() && from?.port == to?.port
+        let stillSafe = to?.scheme == "https" || from?.scheme == "http"
+        completionHandler(sameServer && stillSafe ? request : nil)
+    }
+
+    // TLS: the certificate is checked (against your CA when one is set) in every mode but Require, which
+    // accepts any certificate because you chose that; a client certificate is offered when the server asks.
+    func urlSession(_ session: URLSession, task: URLSessionTask, didReceive challenge: URLAuthenticationChallenge,
                     completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
         let space = challenge.protectionSpace
         if space.authenticationMethod == NSURLAuthenticationMethodServerTrust, let trust = space.serverTrust {
-            if tls.mode == .require || tls.mode == .prefer { return completionHandler(.useCredential, URLCredential(trust: trust)) }
-            if !tls.anchors.isEmpty {
-                SecTrustSetPolicies(trust, SecPolicyCreateSSL(true, space.host as CFString))
-                SecTrustSetAnchorCertificates(trust, tls.anchors as CFArray)
-                SecTrustSetAnchorCertificatesOnly(trust, true)
-                return SecTrustEvaluateWithError(trust, nil) ? completionHandler(.useCredential, URLCredential(trust: trust))
-                                                             : completionHandler(.cancelAuthenticationChallenge, nil)
+            if tls.mode == .require { return completionHandler(.useCredential, URLCredential(trust: trust)) }
+            // Through a tunnel the request goes to 127.0.0.1, but the certificate is still the server's.
+            let name = tls.peerName ?? space.host
+            if tls.anchors.isEmpty && name == space.host { return completionHandler(.performDefaultHandling, nil) }
+            if let reason = TLSTrust.problem(trust, host: name, anchors: tls.anchors) {
+                lock.lock(); pending[task.taskIdentifier]?.distrust = reason; lock.unlock()
+                return completionHandler(.cancelAuthenticationChallenge, nil)
             }
-            return completionHandler(.performDefaultHandling, nil)
+            return completionHandler(.useCredential, URLCredential(trust: trust))
         }
         if space.authenticationMethod == NSURLAuthenticationMethodClientCertificate, let identity = tls.identity {
             return completionHandler(.useCredential, URLCredential(identity: identity, certificates: nil, persistence: .forSession))
@@ -95,10 +147,51 @@ final class HTTPClient: NSObject, URLSessionDelegate, @unchecked Sendable {
 
     /// http(s)://host[:port] from a host field that may already be a URL.
     static func baseURL(host: String, port: Int, secure: Bool) -> URL? {
-        if host.hasPrefix("http://") || host.hasPrefix("https://") { return URL(string: host) }
+        let lower = host.lowercased()
+        if lower.hasPrefix("http://") || lower.hasPrefix("https://") { return URL(string: host) }
         let defaultPort = secure ? 443 : 80
         let portPart = port == 0 || port == defaultPort ? "" : ":\(port)"
         return URL(string: "\(secure ? "https" : "http")://\(host)\(portPart)")
+    }
+
+    /// Where an engine reached over HTTP is: `baseURL`, refused when it would send the password or token as
+    /// plain text to a server out on the internet without you having chosen TLS Off. An http:// address in
+    /// the host field doesn't count as that choice: it can come from a pasted URL or an imported file.
+    static func endpoint(host: String, port: Int, tls: ConnectionConfig.TLS) throws -> URL {
+        let field = host.lowercased().hasPrefix("libsql://") ? "https://" + host.dropFirst(9) : host
+        let lower = field.lowercased()
+        // A field with another scheme in it is no address for HTTP.
+        guard !lower.contains("://") || lower.hasPrefix("http://") || lower.hasPrefix("https://") else { throw DatabaseError("\(host) isn't a valid address.") }
+        guard let url = baseURL(host: field, port: port, secure: tls != .off), let name = url.host, !name.isEmpty,
+              ["http", "https"].contains(url.scheme?.lowercased() ?? "") else {
+            throw DatabaseError("\(host) isn't a valid address.")
+        }
+        if url.scheme?.lowercased() == "http", tls != .off, !HostScope.isLocal(name) {
+            throw DatabaseError("\(host) is a plain HTTP address, so the sign-in would cross the network as plain text.",
+                                detail: "Nothing was sent. Use an https:// address, or set TLS to Off if you really want a plain connection to this server.")
+        }
+        return url
+    }
+
+    /// Whether a server may move the rest of a session to `next` (libSQL's base_url): only to HTTPS on the
+    /// same server or one in the same domain, since every request carries the token. Without that, whoever
+    /// answers once could send the token anywhere.
+    static func mayMove(from current: URL, to next: URL) -> Bool {
+        guard let a = current.host?.lowercased(), let b = next.host?.lowercased(), next.user == nil else { return false }
+        if a == b { return next.scheme?.lowercased() == current.scheme?.lowercased() && next.port == current.port }
+        return next.scheme?.lowercased() == "https" && !HostScope.isAddress(a) && MongoDriver.srvTargetAllowed(b, for: a)
+    }
+
+    /// An address a token may be sent to: HTTPS, or plain HTTP only on this Mac or a private network
+    /// (an emulator). Used where there's no TLS setting to turn off by hand.
+    static func tokenEndpoint(_ text: String) throws -> URL {
+        guard let url = URL(string: text), let scheme = url.scheme?.lowercased(), let host = url.host, !host.isEmpty else {
+            throw DatabaseError("\(text) isn't a valid address.")
+        }
+        guard scheme == "https" || (scheme == "http" && HostScope.isLocal(host)) else {
+            throw DatabaseError("\(text) isn't an HTTPS address.", detail: "The sign-in would cross the network as plain text. Plain HTTP is only used on this Mac or a private network.")
+        }
+        return url
     }
 }
 

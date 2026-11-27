@@ -326,7 +326,7 @@ final class Workspace: ObservableObject {
     func starterQuery(_ object: DBObject) -> String {
         let d = session.dialect
         switch session.kind {
-        case .mongodb: return "db.getCollection(\"\(object.name)\").find({}).limit(100)"
+        case .mongodb: return "\(MongoText.collection(object.table)).find({}).limit(100)"
         case .redis: return "SCAN 0 MATCH * COUNT 100"
         case .sqlserver: return "SELECT TOP 100 * FROM \(d.qualified(object.table));"
         case .oracle: return "SELECT * FROM \(d.qualified(object.table)) FETCH FIRST 100 ROWS ONLY;"
@@ -354,17 +354,22 @@ final class Workspace: ObservableObject {
 
     func exportTable(_ object: DBObject, format: ExportFormat) {
         let panel = NSSavePanel()
-        panel.nameFieldStringValue = "\(object.name).\(format.fileExtension)"
+        // A table can be named anything; the suggested file name can't hold a slash or start with a dot.
+        panel.nameFieldStringValue = "\(Export.fileName(object.name)).\(format.fileExtension)"
         panel.allowedContentTypes = [format.type]
+        let formulas = format == .csv ? CSVOptions.checkbox() : nil
+        panel.accessoryView = formulas.map(CSVOptions.accessory)
         guard let window else { return }
         panel.beginSheetModal(for: window) { response in
             guard response == .OK, let url = panel.url else { return }
+            let protect = formulas.map(CSVOptions.read) ?? false
             let dialect = self.session.dialect
             let sql = "SELECT * FROM \(dialect.qualified(object.table))"
             Task {
                 do {
                     let result = try await self.session.run { try $0.execute(sql).first(where: \.hasRows) ?? QueryResult() }
-                    try format.data(columns: result.columns, rows: result.rows, name: object.name, table: object.table, dialect: dialect).write(to: url)
+                    try format.data(columns: result.columns, rows: result.rows, name: object.name, table: object.table, dialect: dialect,
+                                    protectFormulas: protect).write(to: url)
                 } catch {
                     showError(error, in: self.window, title: "Export failed")
                 }
@@ -374,12 +379,15 @@ final class Workspace: ObservableObject {
 
     func exportResult(columns: [ResultColumn], rows: [[String?]], name: String, format: ExportFormat, table: TableRef?) {
         let panel = NSSavePanel()
-        panel.nameFieldStringValue = "\(name).\(format.fileExtension)"
+        panel.nameFieldStringValue = "\(Export.fileName(name)).\(format.fileExtension)"
         panel.allowedContentTypes = [format.type]
+        let formulas = format == .csv ? CSVOptions.checkbox() : nil
+        panel.accessoryView = formulas.map(CSVOptions.accessory)
         let dialect = session.dialect
         let handler: (NSApplication.ModalResponse) -> Void = { response in
             guard response == .OK, let url = panel.url else { return }
-            do { try format.data(columns: columns, rows: rows, name: name, table: table, dialect: dialect).write(to: url) }
+            let protect = formulas.map(CSVOptions.read) ?? false
+            do { try format.data(columns: columns, rows: rows, name: name, table: table, dialect: dialect, protectFormulas: protect).write(to: url) }
             catch { showError(error, in: self.window, title: "Export failed") }
         }
         if let key = NSApp.keyWindow, key != window { panel.beginSheetModal(for: key, completionHandler: handler) }

@@ -4,6 +4,7 @@ import Foundation
 // base-tool query <url> <sql>    runs SQL and prints the results
 // base-tool schema <url>         prints databases, schemas, tables and the columns of each table
 // base-tool ssh <user@host:port> <key file or -> <url> <sql>   runs SQL through an SSH tunnel; the URL's host is as seen from the SSH server
+// MB_TOOL=<path>   where sqlplus or duckdb is, when it isn't in one of the usual places (a URL can't say: it never names a program to run)
 let args = CommandLine.arguments
 if args.count == 3, args[1] == "format" {
     print(SQLFormatter.format(args[2]), terminator: "")
@@ -51,6 +52,8 @@ if args[1] == "ssh", args.count >= 6 {
     }
     _ = parsed
 }
+
+if let tool = ProcessInfo.processInfo.environment["MB_TOOL"], !tool.isEmpty { config.localToolPath = tool }
 
 do {
     let certPassword = URLComponents(string: args[args[1] == "ssh" ? 4 : 2])?.queryItems?.first { $0.name == "sslpassword" }?.value

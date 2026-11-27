@@ -16,6 +16,23 @@ import SwiftUI
 //   --demo --open=<table> --bench   scrolls the grid and prints the time per frame, then quits
 //   --demo --background     doesn't come to the front (for scripted checks while you work)
 //   --demo --also=<url>     opens a second connection too (window tabs)   --split   shows two tabs side by side
+//
+// --url=, --also=, --query= and --verify-update reach outside the demo's own sample database, so only a
+// development build takes them (see `DevelopmentFlags`); the released app ignores them.
+
+/// Launch flags that connect to a server named on the command line (--url=, --also=), run SQL as the app
+/// starts (--query=) or run the updater's checks on a path (--verify-update). They are for development:
+/// a debug build takes them, and so does a bare `swift build` binary (`.build/release/Base`, which the
+/// scroll benchmark in CONTRIBUTING.md runs). The app bundle that is built for release never does.
+enum DevelopmentFlags {
+    static let allowed: Bool = {
+        #if DEBUG
+        return true
+        #else
+        return !isBundled
+        #endif
+    }()
+}
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
@@ -258,7 +275,7 @@ enum Demo {
             showError(error, in: nil, title: "Couldn't build the demo database")
             return
         }
-        if let url = argument("url") {
+        if let url = developmentArgument("url") {
             var c = ConnectionConfig()
             let parsed = c.apply(url: url)
             c.environment = argument("env").flatMap(ConnectionConfig.Environment.init(rawValue:)) ?? .local
@@ -296,7 +313,7 @@ enum Demo {
             list.connect(window: nil)
         }
         // --also=<url>: a second connection, to see connections as window tabs.
-        if let also = argument("also") {
+        if let also = developmentArgument("also") {
             var c2 = ConnectionConfig()
             let r = c2.apply(url: also)
             Task {
@@ -313,6 +330,9 @@ enum Demo {
     static func argument(_ name: String) -> String? {
         CommandLine.arguments.first { $0.hasPrefix("--\(name)=") }.map { String($0.dropFirst(name.count + 3)) }
     }
+
+    /// A flag only a development build takes.
+    static func developmentArgument(_ name: String) -> String? { DevelopmentFlags.allowed ? argument(name) : nil }
 
     /// Puts the first workspace in the state the launch flags ask for.
     static func prepare(_ workspace: Workspace) {
@@ -338,7 +358,7 @@ enum Demo {
                 }
                 tab.gridSelectionChanged([1])
             }
-            if let sql = argument("query") {
+            if let sql = developmentArgument("query") {
                 let q = workspace.newQuery(text: sql)
                 if !args.contains("--format") && !args.contains("--explain") { q.run(sql) }
                 if args.contains("--all") {
@@ -472,7 +492,7 @@ struct SeededRandom {
     }
 }
 
-Updater.verifyIfRequested()   // --verify-update <app> <version>: prints the result and exits
+Updater.verifyIfRequested()   // --verify-update <app> <version>: prints the result and exits (development builds)
 
 MainActor.assumeIsolated {
     let app = NSApplication.shared

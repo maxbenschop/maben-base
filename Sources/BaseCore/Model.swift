@@ -108,6 +108,12 @@ public enum DatabaseKind: String, Codable, CaseIterable, Sendable {
 
     public var supportsSSH: Bool { !isFile && !isCloudAPI }
 
+    /// Reached over HTTP or HTTPS, where the certificate is checked unless you chose TLS Require.
+    public var usesHTTP: Bool { self == .clickhouse || self == .libsql }
+
+    /// TLS from the first byte: there's no asking the server first, so TLS Prefer can't fall back to plain.
+    public var startsWithTLS: Bool { [.redis, .mongodb, .cassandra].contains(self) }
+
     /// Edits, filters and structure use SQL.
     public var isSQL: Bool { self != .mongodb && self != .redis }
 
@@ -156,6 +162,29 @@ public struct QueryResult: Sendable {
     }
 
     public var hasRows: Bool { !columns.isEmpty }
+
+    /// Makes every row as wide as the columns: short rows get NULLs, long ones lose the extra values.
+    /// The grid reads rows by column, so a result that isn't a rectangle must never leave a driver.
+    public mutating func squareUp() {
+        let width = columns.count
+        guard width > 0 else { return }
+        for i in rows.indices where rows[i].count != width {
+            rows[i] = rows[i].count > width ? Array(rows[i].prefix(width)) : rows[i] + [String?](repeating: nil, count: width - rows[i].count)
+        }
+    }
+}
+
+/// One row of an answer to a query the app wrote itself. A column the server left out reads as NULL, so
+/// an answer with fewer columns than the query asked for can't stop the app.
+public struct Row: RandomAccessCollection, Equatable, Sendable, ExpressibleByArrayLiteral {
+    public let values: [String?]
+
+    public init(_ values: [String?]) { self.values = values }
+    public init(arrayLiteral elements: String?...) { values = elements }
+
+    public var startIndex: Int { 0 }
+    public var endIndex: Int { values.count }
+    public subscript(position: Int) -> String? { values.indices.contains(position) ? values[position] : nil }
 }
 
 public struct DatabaseError: Error, LocalizedError, Sendable {
@@ -174,6 +203,11 @@ public struct DatabaseError: Error, LocalizedError, Sendable {
 
     public var errorDescription: String? {
         [message, detail].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: "\n")
+    }
+
+    /// The server (or something answering in its place) sent bytes that don't follow its protocol.
+    public static func malformedReply(_ detail: String? = nil) -> DatabaseError {
+        DatabaseError("The server sent a reply this app doesn't understand.", detail: detail)
     }
 }
 
@@ -336,6 +370,13 @@ public protocol Driver: AnyObject {
 
     /// Runs one or more statements. Results past `rowLimit` rows are read and dropped.
     func execute(_ sql: String, rowLimit: Int) throws -> [QueryResult]
+    /// Runs what the user typed in the query editor. The same as `execute`, except for engines whose tool
+    /// has commands that reach this Mac (DuckDB's .shell): those run only from here, never from a file or
+    /// from text the app put together.
+    func executeTyped(_ sql: String, rowLimit: Int) throws -> [QueryResult]
+    /// Writes staged edits as one unit. SQL engines run the dialect's statements; engines whose commands
+    /// aren't SQL build them from the values themselves, so a value is never read back as command text.
+    func apply(_ changes: ChangeSet, table: TableRef, columns: [ResultColumn], primaryKey: [String]) throws
     /// Asks the server to stop the running statement. Safe to call from any thread.
     func cancel()
     func close()
@@ -358,9 +399,15 @@ public protocol Driver: AnyObject {
 public extension Driver {
     func execute(_ sql: String) throws -> [QueryResult] { try execute(sql, rowLimit: .max) }
 
+    func executeTyped(_ sql: String, rowLimit: Int) throws -> [QueryResult] { try execute(sql, rowLimit: rowLimit) }
+
+    func apply(_ changes: ChangeSet, table: TableRef, columns: [ResultColumn], primaryKey: [String]) throws {
+        try runAsUnit(try dialect.statements(for: changes, table: table, columns: columns, primaryKey: primaryKey), checkFound: true)
+    }
+
     /// The first result of a statement that returns rows.
-    func rows(_ sql: String) throws -> [[String?]] {
-        try execute(sql).first(where: \.hasRows)?.rows ?? []
+    func rows(_ sql: String) throws -> [Row] {
+        try execute(sql).first(where: \.hasRows)?.rows.map(Row.init) ?? []
     }
 }
 

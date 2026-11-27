@@ -28,6 +28,9 @@ public final class SQLiteDriver: Driver, SQLiteSchema {
         }
         sqlite3_busy_timeout(db, 5000)
         sqlite3_extended_result_codes(db, 1)
+        // The file is opened read-only, but a database attached later wouldn't be: query_only refuses every
+        // write on this connection, whichever file it is for.
+        if readOnly { sqlite3_exec(db, "PRAGMA query_only = ON", nil, nil, nil) }
     }
 
     private var lastError: DatabaseError {

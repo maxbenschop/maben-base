@@ -82,6 +82,8 @@ final class ToolProcess: @unchecked Sendable {
         if process.isRunning { process.terminate() }
     }
 
+    /// `configured` is the path typed in the connection's editor on this Mac (`ConnectionConfig.localToolPath`):
+    /// it is the one setting that names a program to run, so it never comes from a URL, a file or sync.
     static func find(_ name: String, configured: String?) -> String? {
         if let configured, !configured.isEmpty { return (configured as NSString).expandingTildeInPath }
         return BackupTool.find(name) ?? ["/opt/homebrew/bin", "/usr/local/bin", "/opt/oracle/instantclient", NSHomeDirectory() + "/instantclient"]
@@ -136,18 +138,36 @@ public final class DuckDBDriver: Driver {
         }
         var args = ["-no-agent", "-csv", "-header", "-nullvalue", Self.null]
         if readOnly { args.append("-readonly") }
-        if !path.isEmpty { args.append(path) }
+        // As a full path, so a file name can never be read as one of the tool's options.
+        if !path.isEmpty { args.append(URL(fileURLWithPath: path).path) }
         tool = try ToolProcess(executable: exe, arguments: args)
         try tool.send(".changes on\n")
         serverVersion = "DuckDB " + (try rows("SELECT version()").first?[0] ?? "")
         currentDatabase = try rows("SELECT current_database()").first?[0] ?? nil
     }
 
-    public func execute(_ sql: String, rowLimit: Int) throws -> [QueryResult] {
+    /// Runs SQL from anywhere but the editor: a file being imported, or statements the app wrote. The duckdb
+    /// tool reads a line that starts with a dot as one of its own commands, and those reach this Mac
+    /// (.shell runs a program, .output and .read open files), so here such a line is refused.
+    public func execute(_ sql: String, rowLimit: Int) throws -> [QueryResult] { try run(sql, rowLimit: rowLimit, typed: false) }
+
+    /// What you typed in the query editor: the tool's dot commands work, as they do in a terminal.
+    public func executeTyped(_ sql: String, rowLimit: Int) throws -> [QueryResult] { try run(sql, rowLimit: rowLimit, typed: true) }
+
+    private func run(_ sql: String, rowLimit: Int, typed: Bool) throws -> [QueryResult] {
         var out: [QueryResult] = []
         for statement in SQLText.statements(in: sql).map(\.sql) {
+            if !typed, let line = DuckDBText.dotCommand(in: statement) {
+                var e = DatabaseError("A line would run a command of the duckdb tool, not SQL: \(line.prefix(60))",
+                                      detail: "Lines that start with a dot (.shell, .read, .output, …) can run programs and open files on this Mac. They only run when you type them in the query editor.")
+                e.completed = out
+                throw e
+            }
             let marker = "__MB_END_\(UUID().uuidString)__"
-            try tool.send(statement + ";\n.print \(marker)\n")
+            // A typed dot command on a line of its own goes as it is: with a semicolon after it, the tool
+            // would hand the semicolon to the command as one more argument.
+            let isCommand = typed && !statement.contains(where: \.isNewline) && DuckDBText.dotCommand(in: statement) != nil
+            try tool.send(statement + (isCommand ? "" : ";") + "\n.print \(marker)\n")
             let (output, errors) = try tool.read(until: marker)
             if !errors.isEmpty {
                 var e = DatabaseError(errors.components(separatedBy: "\n").first ?? errors, detail: errors.contains("\n") ? errors : nil)
@@ -172,8 +192,10 @@ public final class DuckDBDriver: Driver {
         if let last = lines.last, last.count == 1, last[0].value.hasPrefix("changes:") { lines.removeLast() }
         guard let header = lines.first else { return QueryResult() }
         let rows = lines.dropFirst().prefix(rowLimit).map { $0.map { $0.value == null ? nil : $0.value } }
-        return QueryResult(columns: header.map { ResultColumn(name: $0.value, typeName: "") }, rows: Array(rows),
-                           message: "\(rows.count) rows", truncated: lines.count - 1 > rowLimit)
+        var result = QueryResult(columns: header.map { ResultColumn(name: $0.value, typeName: "") }, rows: Array(rows),
+                                 message: "\(rows.count) rows", truncated: lines.count - 1 > rowLimit)
+        result.squareUp()
+        return result
     }
 
     public func cancel() { tool.interrupt() }
@@ -254,7 +276,176 @@ public final class DuckDBDriver: Driver {
     }
 }
 
+/// Reading SQL the way the duckdb tool does, to tell which lines it would take as its own commands.
+enum DuckDBText {
+    /// The first line the tool would read as a dot command: one that starts with a dot while no statement is
+    /// under way. Lines inside a string, a quoted name or a dollar-quoted string are part of that value and
+    /// are never commands, so data with such lines is fine. Comments don't count as a statement under way.
+    static func dotCommand(in sql: String) -> String? {
+        let chars = Array(sql)
+        var i = 0
+        var pending = false  // SQL seen since the last ; that ended a statement
+        var lineStart = true
+        func line(from start: Int) -> String { String(chars[start...].prefix(while: { $0 != "\n" && $0 != "\r\n" && $0 != "\r" })) }
+        func isBreak(_ c: Character) -> Bool { c == "\n" || c == "\r\n" || c == "\r" }
+        while i < chars.count {
+            let c = chars[i]
+            if lineStart {
+                if c == " " || c == "\t" { i += 1; continue }
+                if c == "." && !pending { return line(from: i) }
+                lineStart = false
+            }
+            if isBreak(c) { lineStart = true; i += 1; continue }
+            if c == "-", i + 1 < chars.count, chars[i + 1] == "-" {
+                while i < chars.count, !isBreak(chars[i]) { i += 1 }
+                continue
+            }
+            if c == "/", i + 1 < chars.count, chars[i + 1] == "*" {
+                // Checked line by line, as if it weren't a comment: refusing too much here costs a clearer file, too little a command.
+                i += 2
+                while i < chars.count, !(chars[i] == "*" && i + 1 < chars.count && chars[i + 1] == "/") {
+                    if isBreak(chars[i]) {
+                        var j = i + 1
+                        while j < chars.count, chars[j] == " " || chars[j] == "\t" { j += 1 }
+                        if j < chars.count, chars[j] == ".", !pending { return line(from: j) }
+                    }
+                    i += 1
+                }
+                i += 2
+                continue
+            }
+            if c == "'" || c == "\"" {
+                pending = true
+                i += 1
+                while i < chars.count {
+                    if chars[i] == c {
+                        if i + 1 < chars.count, chars[i + 1] == c { i += 2; continue }
+                        break
+                    }
+                    i += 1
+                }
+                i += 1
+                continue
+            }
+            if c == "$" {
+                var j = i + 1
+                while j < chars.count, chars[j].isLetter || chars[j].isNumber || chars[j] == "_" { j += 1 }
+                if j < chars.count, chars[j] == "$" {
+                    let tag = Array(chars[i...j])
+                    var k = j + 1
+                    while k + tag.count <= chars.count, Array(chars[k..<k + tag.count]) != tag { k += 1 }
+                    pending = true
+                    i = min(chars.count, k + tag.count)
+                    continue
+                }
+            }
+            if c == ";" { pending = false } else if !c.isWhitespace { pending = true }
+            i += 1
+        }
+        return nil
+    }
+}
+
 // MARK: - Oracle
+
+/// What goes to SQL*Plus on its standard input. SQL*Plus reads a line at a time and has commands of its own
+/// (HOST runs a program), so nothing that came from a database or a settings field may start or end a line.
+enum OracleText {
+    /// The settings that go in before signing in. DEFINE, ESCAPE and CMDSEP are off so that &, \ and ; in a
+    /// value, or in the password on the CONNECT line, are only characters.
+    static let settings = """
+        WHENEVER SQLERROR CONTINUE
+        SET DEFINE OFF
+        SET ESCAPE OFF
+        SET CMDSEP OFF
+        SET MARKUP CSV ON QUOTE ON
+        SET PAGESIZE 50000
+        SET FEEDBACK ON
+        SET TERMOUT ON
+        SET ECHO OFF
+        SET VERIFY OFF
+        SET SQLBLANKLINES ON
+        SET LONG 10000000
+        SET LONGCHUNKSIZE 10000000
+        SET NUMWIDTH 40
+        """
+
+    static let session = """
+        ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD HH24:MI:SS';
+        ALTER SESSION SET NLS_TIMESTAMP_FORMAT = 'YYYY-MM-DD HH24:MI:SS.FF';
+        ALTER SESSION SET NLS_NUMERIC_CHARACTERS = '.,';
+        """
+
+    /// -R 3 is SQL*Plus's restricted mode: HOST, !, @, START, SPOOL, EDIT, GET, SAVE and STORE are off, so
+    /// even a line that did get through couldn't run a program or touch a file.
+    static let arguments = ["-S", "-L", "-R", "3", "/nolog"]
+
+    /// The CONNECT line. Each part is one field of the connection; a line break in any of them would start
+    /// a new line for SQL*Plus to read as a command, so control characters are refused, and so is anything
+    /// that would end the part it is in.
+    static func connectLine(user: String, password: String, host: String, port: Int, service: String) throws -> String {
+        func refuse(_ what: String) -> DatabaseError {
+            DatabaseError("The \(what) has a character that can't be used with sqlplus.", detail: "Line breaks, control characters and double quotes can't be sent to it.")
+        }
+        for (what, value) in [("user name", user), ("password", password), ("host", host), ("service", service)] {
+            if ConnectionConfig.hasControl(value) || value.contains("\"") { throw refuse(what) }
+        }
+        if host.isEmpty || host.contains(where: { $0.isWhitespace || $0 == "/" || $0 == "@" }) { throw refuse("host") }
+        if service.contains(where: { $0.isWhitespace || $0 == "/" || $0 == "@" }) { throw refuse("service") }
+        guard (1...65535).contains(port) else { throw DatabaseError("\(port) isn't a port number.") }
+        // A plain user name stays unquoted (Oracle upper-cases it); the password is quoted (it's case-sensitive).
+        let plainUser = user.allSatisfy { $0.isLetter || $0.isNumber || $0 == "_" || $0 == "$" || $0 == "#" }
+        return "CONNECT \(plainUser ? user : "\"\(user)\"")/\"\(password)\"@//\(host):\(port)/\(service.isEmpty ? "FREEPDB1" : service)"
+    }
+
+    /// Refuses a statement in which a quoted name holds a line break or another control character. A table
+    /// or column can be named that way, and its name would then put a line of its own in front of SQL*Plus.
+    /// (Values never do: the app writes their control characters as CHR(n), see `Dialect.literal`.)
+    static func check(_ statement: String) throws {
+        let chars = Array(statement)
+        var i = 0
+        func skipString(_ quote: Character) {
+            i += 1
+            while i < chars.count {
+                if chars[i] == quote {
+                    if i + 1 < chars.count, chars[i + 1] == quote { i += 2; continue }
+                    break
+                }
+                i += 1
+            }
+            i += 1
+        }
+        while i < chars.count {
+            let c = chars[i]
+            if c == "-", i + 1 < chars.count, chars[i + 1] == "-" {
+                while i < chars.count, chars[i] != "\n" { i += 1 }
+            } else if c == "/", i + 1 < chars.count, chars[i + 1] == "*" {
+                i += 2
+                while i < chars.count, !(chars[i] == "*" && i + 1 < chars.count && chars[i + 1] == "/") { i += 1 }
+                i += 2
+            } else if (c == "q" || c == "Q"), i + 2 < chars.count, chars[i + 1] == "'", i == 0 || !(chars[i - 1].isLetter || chars[i - 1].isNumber || chars[i - 1] == "_") || "nN".contains(chars[i - 1]) {
+                // q'[ … ]': ends at the closing delimiter followed by a quote.
+                let open = chars[i + 2]
+                let close: Character = ["[": "]", "{": "}", "(": ")", "<": ">"][open] ?? open
+                i += 3
+                while i < chars.count, !(chars[i] == close && i + 1 < chars.count && chars[i + 1] == "'") { i += 1 }
+                i += 2
+            } else if c == "'" {
+                skipString("'")
+            } else if c == "\"" {
+                let start = i
+                skipString("\"")
+                let name = String(chars[start..<min(i, chars.count)])
+                if ConnectionConfig.hasControl(name) {
+                    throw DatabaseError("A quoted name in this statement has a line break or another control character in it.",
+                                        detail: "sqlplus reads a line at a time, so a name like that can't be sent to it safely. Nothing was run.")
+                }
+            } else {
+                i += 1
+            }
+        }
+    }
+}
 
 /// Oracle through SQL*Plus (Oracle Instant Client's sqlplus, 12.2 or later for CSV output). The password is
 /// sent on standard input, never on the command line.
@@ -271,30 +462,10 @@ public final class OracleDriver: Driver {
             throw DatabaseError("sqlplus isn't installed.", detail: "Maben Base talks to Oracle through Oracle Instant Client's sqlplus. Install Instant Client (Basic and SQL*Plus) and set its path in the connection's Tool field.")
         }
         self.user = user
-        tool = try ToolProcess(executable: exe, arguments: ["-S", "-L", "/nolog"])
-        func q(_ s: String) -> String { "\"" + s.replacingOccurrences(of: "\"", with: "") + "\"" }
-        let target = "//\(host):\(port)/\(service.isEmpty ? "FREEPDB1" : service)"
-        let settings = """
-            WHENEVER SQLERROR CONTINUE
-            SET MARKUP CSV ON QUOTE ON
-            SET PAGESIZE 50000
-            SET FEEDBACK ON
-            SET TERMOUT ON
-            SET ECHO OFF
-            SET VERIFY OFF
-            SET SQLBLANKLINES ON
-            SET DEFINE OFF
-            SET LONG 10000000
-            SET LONGCHUNKSIZE 10000000
-            SET NUMWIDTH 40
-            ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD HH24:MI:SS';
-            ALTER SESSION SET NLS_TIMESTAMP_FORMAT = 'YYYY-MM-DD HH24:MI:SS.FF';
-            ALTER SESSION SET NLS_NUMERIC_CHARACTERS = '.,';
-            """
+        let connect = try OracleText.connectLine(user: user, password: password, host: host, port: port, service: service)
+        tool = try ToolProcess(executable: exe, arguments: OracleText.arguments)
         let marker = "__MB_END_\(UUID().uuidString)__"
-        // A plain user name stays unquoted (Oracle upper-cases it); the password is quoted (it's case-sensitive).
-        let plainUser = user.allSatisfy { $0.isLetter || $0.isNumber || $0 == "_" || $0 == "$" || $0 == "#" }
-        try tool.send("CONNECT \(plainUser ? user : q(user))/\(q(password))@\(target)\n\(settings)\nPROMPT \(marker)\n")
+        try tool.send("\(OracleText.settings)\n\(connect)\n\(OracleText.session)\nPROMPT \(marker)\n")
         let (output, errors) = try tool.read(until: marker)
         if let e = Self.error(output + "\n" + errors) { throw DatabaseError("Oracle refused the connection.", detail: e) }
         serverVersion = "Oracle " + (try rows("SELECT version_full FROM product_component_version WHERE ROWNUM = 1").first?[0] ?? "")
@@ -311,6 +482,10 @@ public final class OracleDriver: Driver {
     public func execute(_ sql: String, rowLimit: Int) throws -> [QueryResult] {
         var out: [QueryResult] = []
         for raw in SQLText.statements(in: sql).map(\.sql) {
+            do { try OracleText.check(raw) } catch var e as DatabaseError {
+                e.completed = out
+                throw e
+            }
             let isBlock = raw.range(of: #"^\s*(BEGIN|DECLARE|CREATE\s+(OR\s+REPLACE\s+)?(PROCEDURE|FUNCTION|PACKAGE|TRIGGER|TYPE))"#, options: [.regularExpression, .caseInsensitive]) != nil
             let statement = isBlock ? raw + ";" : raw
             let marker = "__MB_END_\(UUID().uuidString)__"
@@ -344,8 +519,10 @@ public final class OracleDriver: Driver {
         let parsed = ToolCSV.parse(csv)
         guard let header = parsed.first else { return QueryResult() }
         let rows = parsed.dropFirst().prefix(rowLimit).map { $0.map { $0.value.isEmpty && !$0.quoted ? nil : $0.value } }
-        return QueryResult(columns: header.map { ResultColumn(name: $0.value, typeName: "") }, rows: Array(rows),
-                           message: feedback, truncated: parsed.count - 1 > rowLimit)
+        var result = QueryResult(columns: header.map { ResultColumn(name: $0.value, typeName: "") }, rows: Array(rows),
+                                 message: feedback, truncated: parsed.count - 1 > rowLimit)
+        result.squareUp()
+        return result
     }
 
     public func cancel() { tool.interrupt() }

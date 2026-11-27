@@ -29,12 +29,12 @@ final class SQLTextTests: XCTestCase {
     }
 
     func testDetectsWrites() {
-        XCTAssertTrue(SQLText.isWrite("update t set a = 1"))
-        XCTAssertTrue(SQLText.isWrite("select 1; DROP TABLE x"))
-        XCTAssertTrue(SQLText.isWrite("-- hi\n  delete from t"))
-        XCTAssertTrue(SQLText.isWrite("with x as (select 1) delete from t using x"))
-        XCTAssertFalse(SQLText.isWrite("select * from updates"))
-        XCTAssertFalse(SQLText.isWrite("explain select 1"))
+        XCTAssertTrue(SQLText.isWrite("update t set a = 1", kind: .postgres))
+        XCTAssertTrue(SQLText.isWrite("select 1; DROP TABLE x", kind: .postgres))
+        XCTAssertTrue(SQLText.isWrite("-- hi\n  delete from t", kind: .postgres))
+        XCTAssertTrue(SQLText.isWrite("with x as (select 1) delete from t using x", kind: .postgres))
+        XCTAssertFalse(SQLText.isWrite("select * from updates", kind: .postgres))
+        XCTAssertFalse(SQLText.isWrite("explain select 1", kind: .postgres))
     }
 }
 
@@ -45,10 +45,12 @@ final class DialectTests: XCTestCase {
     func testQuotingAndLiterals() {
         XCTAssertEqual(pg.quote("we\"ird"), "\"we\"\"ird\"")
         XCTAssertEqual(my.quote("we`ird"), "`we``ird`")
-        XCTAssertEqual(pg.literal("it's \\ fine"), "'it''s \\ fine'")
+        // With a backslash, Postgres gets E'…', which reads the same whatever standard_conforming_strings is.
+        XCTAssertEqual(pg.literal("it's \\ fine"), "E'it''s \\\\ fine'")
+        XCTAssertEqual(pg.literal("it's fine"), "'it''s fine'")
         XCTAssertEqual(my.literal("it's \\ fine"), "'it''s \\\\ fine'")
         XCTAssertEqual(pg.literal(nil), "NULL")
-        XCTAssertEqual(pg.literal("\\xdeadbeef", binary: true), "'\\xdeadbeef'")
+        XCTAssertEqual(pg.literal("\\xdeadbeef", binary: true), "E'\\\\xdeadbeef'")
         XCTAssertEqual(my.literal("0xDEADBEEF", binary: true), "X'DEADBEEF'")
         XCTAssertEqual(my.literal("not hex", binary: true), "'not hex'")
         XCTAssertEqual(pg.qualified(TableRef(schema: "public", name: "users")), "\"public\".\"users\"")
@@ -88,7 +90,7 @@ final class DialectTests: XCTestCase {
 
     func testFilters() {
         XCTAssertEqual(pg.whereClause([Filter(column: "name", op: .contains, value: "50%")]),
-                       "\"name\"::text ILIKE '%50\\%%' ESCAPE '\\'")
+                       "\"name\"::text ILIKE E'%50\\\\%%' ESCAPE E'\\\\'")
         XCTAssertEqual(my.whereClause([Filter(column: "id", op: .in, value: "1, 2")]), "`id` IN ('1', '2')")
         var off = Filter(column: "x", op: .isNull)
         off.enabled = false

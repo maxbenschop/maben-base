@@ -6,21 +6,60 @@ import Foundation
 public final class SSHTunnel {
     public let localPort: Int
     private let process: Process
-    private let errors = Pipe()
 
     public init(config: ConnectionConfig, secret: String? = nil) throws {
-        localPort = try Self.freePort()
-        process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
         let secret = secret.flatMap { $0.isEmpty ? nil : $0 }
-        var args = [
+        // Nothing is run for settings ssh would misread.
+        _ = try Self.arguments(config: config, localPort: 1, hasSecret: secret != nil)
+        // The local port is picked first and bound by ssh a moment later, so another program can take it in
+        // between. ssh then gives up (ExitOnForwardFailure) and the next port is tried.
+        var last: DatabaseError?
+        for _ in 0..<3 {
+            do {
+                (process, localPort) = try Self.start(config: config, secret: secret)
+                return
+            } catch let error as Refused {
+                last = error.error
+            }
+        }
+        throw last ?? DatabaseError("The SSH tunnel didn't start.")
+    }
+
+    /// ssh couldn't listen on the local port it was given.
+    private struct Refused: Error { let error: DatabaseError }
+
+    /// A host or user name ssh can be given: no line breaks or other control characters, no spaces, and not
+    /// starting with a hyphen (which ssh would read as an option).
+    static func isUsable(_ name: String) -> Bool {
+        !name.hasPrefix("-") && !ConnectionConfig.hasControl(name) && !name.contains(where: \.isWhitespace)
+    }
+
+    /// The arguments for ssh. Throws for a host or user that could be read as something else.
+    static func arguments(config: ConnectionConfig, localPort: Int, hasSecret: Bool, verbose: Bool = false) throws -> [String] {
+        func refuse(_ what: String, _ value: String) -> DatabaseError {
+            DatabaseError("The \(what) \(value.prefix(60)) can't be used for an SSH tunnel.",
+                          detail: "It can't be empty, start with a hyphen, or hold spaces or line breaks.")
+        }
+        guard !config.sshHost.isEmpty, isUsable(config.sshHost) else { throw refuse("SSH host", config.sshHost) }
+        guard isUsable(config.sshUser), !config.sshUser.contains("@") else { throw refuse("SSH user", config.sshUser) }
+        guard !config.host.isEmpty, isUsable(config.host), !config.host.contains(","), !config.host.hasPrefix("/") else { throw refuse("host", config.host) }
+        guard (1...65535).contains(config.port) else { throw DatabaseError("\(config.port) isn't a port number.", detail: "Ports go from 1 to 65535.") }
+        guard (1...65535).contains(config.sshPort) else { throw DatabaseError("\(config.sshPort) isn't a port number.", detail: "Ports go from 1 to 65535.") }
+        // An IPv6 address goes in brackets, or its colons would be read as the separators.
+        let target = config.host.contains(":") && !config.host.hasPrefix("[") ? "[\(config.host)]" : config.host
+        var args = verbose ? ["-v"] : []
+        args += [
             "-N", "-T",
-            "-o", secret == nil ? "BatchMode=yes" : "NumberOfPasswordPrompts=1",
+            "-o", hasSecret ? "NumberOfPasswordPrompts=1" : "BatchMode=yes",
+            // ssh ends when it can't listen on the local port, instead of going on without the forward.
             "-o", "ExitOnForwardFailure=yes",
             "-o", "ConnectTimeout=10",
             "-o", "ServerAliveInterval=30",
+            // A new server's key is kept; a changed key is refused.
             "-o", "StrictHostKeyChecking=accept-new",
-            "-L", "127.0.0.1:\(localPort):\(config.host):\(config.port)",
+            // Its own connection, never one shared through ~/.ssh/config: the port must be this ssh's to listen on.
+            "-o", "ControlMaster=no", "-o", "ControlPath=none",
+            "-L", "127.0.0.1:\(localPort):\(target):\(config.port)",
         ]
         if config.sshPort != 22 { args += ["-p", "\(config.sshPort)"] }
         if config.sshUsePassword {
@@ -28,11 +67,20 @@ public final class SSHTunnel {
         } else if !config.sshKeyPath.isEmpty {
             args += ["-i", (config.sshKeyPath as NSString).expandingTildeInPath, "-o", "IdentitiesOnly=yes"]
         }
+        // After --, what follows is the server and nothing else.
+        args += ["--", config.sshUser.isEmpty ? config.sshHost : "\(config.sshUser)@\(config.sshHost)"]
+        return args
+    }
+
+    private static func start(config: ConnectionConfig, secret: String?) throws -> (Process, Int) {
+        let localPort = try freePort()
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
         var askpass: URL?
         if let secret {
             // A tiny script ssh runs to get the secret; the secret itself travels in its environment.
             let dir = FileManager.default.temporaryDirectory.appendingPathComponent("mb-askpass-\(UUID().uuidString)")
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
             let script = dir.appendingPathComponent("askpass")
             // The secret goes as hex: environment values can have their Unicode rewritten on the way (é → e + ´).
             try "#!/bin/sh\nprintf '%s' \"$MB_SSH_SECRET_HEX\" | /usr/bin/xxd -r -p\necho\n".write(to: script, atomically: true, encoding: .utf8)
@@ -46,10 +94,10 @@ public final class SSHTunnel {
             process.environment = env
         }
         defer { if let askpass { try? FileManager.default.removeItem(at: askpass) } }
-        args.append(config.sshUser.isEmpty ? config.sshHost : "\(config.sshUser)@\(config.sshHost)")
         // MB_SSH_DEBUG=1: ssh explains itself in the error message.
-        if ProcessInfo.processInfo.environment["MB_SSH_DEBUG"] != nil { args.insert("-v", at: 0) }
-        process.arguments = args
+        process.arguments = try arguments(config: config, localPort: localPort, hasSecret: secret != nil,
+                                          verbose: ProcessInfo.processInfo.environment["MB_SSH_DEBUG"] != nil)
+        let errors = Pipe()
         process.standardError = errors
         // Keep reading ssh's messages so its pipe never fills up during a long session.
         let collected = Collected()
@@ -59,26 +107,54 @@ public final class SSHTunnel {
         try process.run()
         Self.register(process)
 
-        // Wait until the forward accepts connections, or ssh gives up.
-        let deadline = Date().addingTimeInterval(15)
+        // Wait until this ssh is the one listening on the port, or it gives up. Being able to connect isn't
+        // enough: whatever answers on the port gets the database sign-in, so it has to be our own ssh.
+        let deadline = Date().addingTimeInterval(20)
         while Date() < deadline {
             if !process.isRunning {
                 usleep(100_000)
+                Self.forget(process)
                 let message = collected.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                throw DatabaseError("The SSH tunnel didn't start.", detail: message.isEmpty ? nil : message)
+                let error = DatabaseError("The SSH tunnel didn't start.", detail: message.isEmpty ? nil : message)
+                if message.contains("Address already in use") || message.contains("cannot listen to port") { throw Refused(error: error) }
+                throw error
             }
-            if Self.canConnect(port: localPort) { return }
+            if isListening(pid: process.processIdentifier, port: localPort) { return (process, localPort) }
             usleep(100_000)
         }
-        close()
+        process.terminate()
+        Self.forget(process)
         throw DatabaseError("The SSH tunnel took too long to start.")
+    }
+
+    /// True when the process `pid` has a TCP socket listening on `port`.
+    static func isListening(pid: Int32, port: Int) -> Bool {
+        let size = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, nil, 0)
+        guard size > 0 else { return false }
+        var fds = [proc_fdinfo](repeating: proc_fdinfo(), count: Int(size) / MemoryLayout<proc_fdinfo>.stride + 8)
+        let used = fds.withUnsafeMutableBytes { proc_pidinfo(pid, PROC_PIDLISTFDS, 0, $0.baseAddress, Int32($0.count)) }
+        guard used > 0 else { return false }
+        for fd in fds.prefix(Int(used) / MemoryLayout<proc_fdinfo>.stride) where fd.proc_fdtype == UInt32(PROX_FDTYPE_SOCKET) {
+            var info = socket_fdinfo()
+            let got = proc_pidfdinfo(pid, fd.proc_fd, PROC_PIDFDSOCKETINFO, &info, Int32(MemoryLayout<socket_fdinfo>.size))
+            guard got == Int32(MemoryLayout<socket_fdinfo>.size), info.psi.soi_kind == Int32(SOCKINFO_TCP) else { continue }
+            let tcp = info.psi.soi_proto.pri_tcp
+            // The port is kept in network byte order.
+            let local = Int(UInt16(bigEndian: UInt16(truncatingIfNeeded: tcp.tcpsi_ini.insi_lport)))
+            if tcp.tcpsi_state == TSI_S_LISTEN, local == port { return true }
+        }
+        return false
     }
 
     public func close() {
         if process.isRunning { process.terminate() }
-        Self.lock.lock()
-        Self.running.removeAll { $0 === process }
-        Self.lock.unlock()
+        Self.forget(process)
+    }
+
+    private static func forget(_ process: Process) {
+        lock.lock()
+        running.removeAll { $0 === process }
+        lock.unlock()
     }
 
     // Every tunnel's ssh is stopped when this process exits, so none are left running after quitting.
