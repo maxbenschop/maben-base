@@ -121,12 +121,16 @@ if (( NEEDS_MERGE )); then
   fi
   [[ -n $PR ]] || die "Couldn't open the pull request."
   print -r -- "https://github.com/$REPO/pull/$PR — waiting for the checks (about 5 minutes)…"
-  # The check takes a moment to appear after the push.
+  # The checks the branch rules require decide; they take a moment to appear after the push.
   for i in {1..30}; do
-    [[ $(gh pr checks "$PR" --json name --jq length 2>/dev/null || echo 0) -gt 0 ]] && break
+    [[ $(gh pr checks "$PR" --required --json name --jq length 2>/dev/null || echo 0) -gt 0 ]] && break
     sleep 10
   done
-  gh pr checks "$PR" --watch --fail-fast --interval 20 >/dev/null || { gh pr checks "$PR" || true; die "The checks failed. Fix it, then run ./ship.sh again."; }
+  gh pr checks "$PR" --required --watch --fail-fast --interval 20 >/dev/null \
+    || { gh pr checks "$PR" || true; die "A required check failed. Fix it, then run ./ship.sh again."; }
+  # Other checks (a secret scanner, for one) don't stop the release, but a failed one is worth a look.
+  OTHER=$(gh pr checks "$PR" --json name,bucket --jq '[.[] | select(.bucket == "fail") | .name] | join(", ")' 2>/dev/null || true)
+  [[ -n $OTHER ]] && print -r -- "Note: not required, but failed: $OTHER. Look at https://github.com/$REPO/pull/$PR/checks"
   # --admin: the branch rules ask for a review by someone else, and the maintainer is the only one here.
   # The required check has passed by now (the line above waits for it).
   gh pr merge "$PR" --squash --admin >/dev/null
@@ -156,3 +160,5 @@ codesign --verify --deep --strict -R="$REQ" "$PROOF/$NAME.app" \
 rm -rf "$PROOF"
 print -r -- "$NAME $NEXT is released: https://github.com/$REPO/releases/tag/v$NEXT"
 print -r -- "Installed copies update themselves within 6 hours."
+[[ -n ${OTHER:-} ]] && print -r -- "Still to look at: the check that failed without being required ($OTHER)."
+exit 0
