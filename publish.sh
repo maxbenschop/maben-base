@@ -6,7 +6,8 @@
 #      -> every installed copy sees it within 6 hours and updates itself
 #   4. rebuilds and deploys base.maben.gg (version, changelog). Its download buttons point at
 #      releases/latest, so they serve the new version as soon as step 3 is done.
-# Needs: gh (logged in as a maintainer), and the website generator in ../maben for step 4 (skipped if missing).
+# Needs: gh (logged in as a maintainer), and ../maben/deploy.sh for step 4 (skipped if missing).
+# ./ship.sh runs the whole release, this script included.
 set -e
 cd "$(dirname "$0")"
 VERSION=$(plutil -extract CFBundleShortVersionString raw Info.plist)
@@ -19,6 +20,17 @@ BUILT="build/archive/notarized/Maben Base.app"
 [[ $(plutil -extract CFBundleShortVersionString raw "$BUILT/Contents/Info.plist") == "$VERSION" ]] \
   || { echo "dist/ holds another version than Info.plist ($VERSION). Run ./release.sh again."; exit 1; }
 xcrun stapler validate "$BUILT" >/dev/null || { echo "The build isn't notarized."; exit 1; }
+
+# What installed copies check before they update: Developer ID, our team, this app, notarized, this version.
+# Checked on the app inside the zip, because that file is what they download. A release can't be changed
+# once it is published, so one they would refuse must never get that far.
+UNPACKED=$(mktemp -d)
+ditto -x -k "$ZIP" "$UNPACKED"
+REQ="anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = \"${TEAM:-NJTYRVLSA8}\" and identifier \"$(plutil -extract CFBundleIdentifier raw Info.plist)\" and notarized"
+codesign --verify --deep --strict -R="$REQ" "$UNPACKED/Maben Base.app" 2>/dev/null \
+  && [[ $(plutil -extract CFBundleShortVersionString raw "$UNPACKED/Maben Base.app/Contents/Info.plist") == "$VERSION" ]] \
+  || { rm -rf "$UNPACKED"; echo "The app in $ZIP wouldn't be accepted as an update. Run ./release.sh again."; exit 1; }
+rm -rf "$UNPACKED"
 
 [[ $(git branch --show-current) == main ]] || { echo "Publish from main."; exit 1; }
 [[ -z $(git status --porcelain) ]] || { echo "Commit or stash your changes first."; exit 1; }
@@ -37,19 +49,11 @@ gh release create "$TAG" "$DMG" "$ZIP" --title "Maben Base $VERSION" --notes-fil
 rm -f "$NOTES"
 echo "GitHub release $TAG is live. Installed copies update within 6 hours."
 
-SITE=../maben
-if [[ -f $SITE/base-site-src/build.py ]]; then
-  python3 - "$SITE/base-site-src/release.json" "$VERSION" <<'PY'
-import json, sys, datetime
-p, version = sys.argv[1], sys.argv[2]
-r = json.load(open(p))
-d = datetime.date.today()
-r.update(version=version, date=d.isoformat(), date_text=f"{d.day} {d.strftime('%B')} {d.year}")
-json.dump(r, open(p, "w"), indent=2)
-PY
-  python3 "$SITE/base-site-src/build.py"
-  HOST_OPT=()
-  ssh -o BatchMode=yes -o ConnectTimeout=5 eq14 true 2>/dev/null || HOST_OPT=(-o HostName=eq14.local)
-  rsync -a --delete --exclude .DS_Store -e "ssh ${HOST_OPT[*]}" "$SITE/base-site/" "eq14:/opt/stacks/maben-site/base-site/"
-  echo "base.maben.gg updated to $VERSION."
+# The website is not part of this repository. Its own deploy script builds it for this version and puts it online.
+DEPLOY=../maben/deploy.sh
+if [[ -x $DEPLOY ]]; then
+  $DEPLOY base --version "$VERSION" --dist "$PWD/dist" \
+    || { echo "The release is live, but the website wasn't updated. Run: $DEPLOY base --version $VERSION --dist $PWD/dist"; exit 1; }
+else
+  echo "Website not updated: $DEPLOY isn't there."
 fi

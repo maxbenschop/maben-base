@@ -18,6 +18,7 @@ public final class MySQLDriver: Driver {
     private let user: String
     private let password: String
     private let tls: TLSOptions
+    private let readOnly: Bool
 
     private enum Cap {
         static let longPassword: UInt32 = 1
@@ -34,14 +35,18 @@ public final class MySQLDriver: Driver {
         static let pluginAuthLenencData: UInt32 = 0x200000
     }
 
-    public init(host: String, port: Int, user: String, password: String, database: String, tls: TLSOptions) throws {
+    public init(host: String, port: Int, user: String, password: String, database: String, tls: TLSOptions, readOnly: Bool = false) throws {
         self.host = host
         self.port = port
         self.user = user
         self.password = password
         self.tls = tls
+        self.readOnly = readOnly
         socket = try Socket(host: host, port: port)
         try handshake(database: database)
+        // A read-only connection also asks the server to refuse writes: every transaction of the session is
+        // read-only. The app's own check of what you run stays in front of it.
+        if readOnly { _ = try? execute("SET SESSION TRANSACTION READ ONLY") }
         currentDatabase = database.isEmpty ? nil : database
         if currentDatabase == nil { currentDatabase = try? rows("SELECT DATABASE()").first?[0] ?? nil }
     }
@@ -54,6 +59,8 @@ public final class MySQLDriver: Driver {
             var header = ByteReader(try socket.read(4))
             let length = Int(header.intLE(3))
             sequence = header.byte() &+ 1
+            // A value can span packets, but not without end.
+            guard payload.count + length <= Socket.maxMessage else { throw DatabaseError.malformedReply("A packet of more than \(Socket.maxMessage) bytes.") }
             payload += try socket.read(length)
             if length < 0xFFFFFF { return payload }
         }
@@ -79,7 +86,7 @@ public final class MySQLDriver: Driver {
         _ = r.byte()
         let code = r.intLE(2)
         var state: String?
-        if r.remaining > 0, r.bytes[r.pos] == UInt8(ascii: "#") {
+        if !r.atEnd, r.bytes[r.pos] == UInt8(ascii: "#") {
             _ = r.byte()
             state = String(decoding: r.take(5), as: UTF8.self)
         }
@@ -125,10 +132,12 @@ public final class MySQLDriver: Driver {
                 req.append(45)
                 req += [UInt8](repeating: 0, count: 23)
                 try writePacket(req)
-                socket.startTLS(tls)
+                // Runs the handshake, and with TLS Verify checks the certificate, before the user name and
+                // the password's answer go out.
+                try socket.startTLS(tls)
                 usingTLS = true
-            } else if tls.mode != .prefer {
-                throw DatabaseError("The server doesn't accept TLS connections.", detail: "Set TLS to Prefer or Off for this connection.")
+            } else if !PlainText.mayFallBack(host: host, mode: tls.mode) {
+                throw PlainText.noTLS(host: host, mode: tls.mode)
             }
         }
 
@@ -138,7 +147,7 @@ public final class MySQLDriver: Driver {
         response.append(45)  // utf8mb4_general_ci
         response += [UInt8](repeating: 0, count: 23)
         response.appendCString(user)
-        let auth = scramble(plugin: plugin, nonce: nonce)
+        let auth = try scramble(plugin: plugin, nonce: nonce)
         response += lenenc(auth.count)
         response += auth
         if !database.isEmpty { response.appendCString(database) }
@@ -147,7 +156,16 @@ public final class MySQLDriver: Driver {
         try finishAuth(plugin: plugin, nonce: nonce)
     }
 
-    private func scramble(plugin: String, nonce: [UInt8]) -> [UInt8] {
+    /// The server names the sign-in method, in its greeting or by switching later. mysql_clear_password asks
+    /// for the password itself, so any server (or anyone answering for it) could ask for it: it is sent only
+    /// when TLS has checked who the server is, or to this Mac or a private network.
+    static func mayUseClearPassword(host: String, verified: Bool) -> Bool { verified || HostScope.isLocal(host) }
+
+    private func scramble(plugin: String, nonce: [UInt8]) throws -> [UInt8] {
+        if plugin == "mysql_clear_password", !Self.mayUseClearPassword(host: host, verified: socket.peerVerified) {
+            throw DatabaseError("The server at \(host) asks for the password as plain text.",
+                                detail: "Nothing was sent. That is only safe when TLS has checked the server's certificate: set TLS to Verify for this connection.")
+        }
         guard !password.isEmpty else { return [] }
         let pw = Array(password.utf8)
         switch plugin {
@@ -179,10 +197,7 @@ public final class MySQLDriver: Driver {
                 _ = r.byte()
                 plugin = r.cString()
                 nonce = Array(r.rest()).prefix(while: { $0 != 0 }).map { $0 }
-                if plugin == "mysql_clear_password" && !usingTLS {
-                    throw DatabaseError("The server wants the password in plain text; turn on TLS for this connection.")
-                }
-                try writePacket(scramble(plugin: plugin, nonce: nonce))
+                try writePacket(try scramble(plugin: plugin, nonce: nonce))
             case 0x01:  // more data: caching_sha2_password
                 guard packet.count >= 2 else { continue }
                 if packet[1] == 3 { continue }  // fast auth worked; OK follows
@@ -190,6 +205,9 @@ public final class MySQLDriver: Driver {
                     if usingTLS || host.hasPrefix("/") {  // a Unix socket counts as a secure channel
                         try writePacket(Array(password.utf8) + [0])
                     } else {
+                        // Not encrypted: the password goes out under the server's public key, which nothing
+                        // vouches for here. Only to this Mac or a private network, or with TLS Off chosen.
+                        guard PlainText.maySendPassword(encrypted: false, host: host, mode: tls.mode) else { throw PlainText.passwordRefused(host: host) }
                         try writePacket([2])  // ask for the public key
                         let keyPacket = try readPacket()
                         guard keyPacket.first == 0x01 else { throw error(from: keyPacket) }
@@ -204,6 +222,7 @@ public final class MySQLDriver: Driver {
     }
 
     private func rsaEncrypt(password: [UInt8], nonce: [UInt8], pem: String) throws -> [UInt8] {
+        guard !nonce.isEmpty else { throw DatabaseError.malformedReply("The sign-in has no challenge.") }
         let xored = password.enumerated().map { $0.element ^ nonce[$0.offset % nonce.count] }
         let base64 = pem.split(separator: "\n").filter { !$0.hasPrefix("-----") }.joined()
         guard var der = Data(base64Encoded: base64) else { throw DatabaseError("The server's public key couldn't be read.") }
@@ -220,28 +239,10 @@ public final class MySQLDriver: Driver {
 
     /// Finds the RSAPublicKey inside a SubjectPublicKeyInfo: the content of its BIT STRING.
     static func pkcs1Range(in der: [UInt8]) -> Range<Int>? {
-        var i = 0
-        func length() -> Int? {
-            guard i < der.count else { return nil }
-            var len = Int(der[i]); i += 1
-            if len & 0x80 != 0 {
-                let n = len & 0x7F
-                len = 0
-                for _ in 0..<n { guard i < der.count else { return nil }; len = len << 8 | Int(der[i]); i += 1 }
-            }
-            return len
-        }
-        guard der.first == 0x30 else { return nil }
-        i = 1; _ = length()
-        guard i < der.count, der[i] == 0x30 else { return nil }  // AlgorithmIdentifier
-        i += 1
-        guard let algLen = length() else { return nil }
-        i += algLen
-        guard i < der.count, der[i] == 0x03 else { return nil }  // BIT STRING
-        i += 1
-        guard let bitLen = length() else { return nil }
-        i += 1  // unused-bits byte
-        return i..<min(der.count, i + bitLen - 1)
+        var r = DER(der)
+        guard r.enter(0x30), r.element(0x30) != nil, let bits = r.element(0x03), bits.count > 1 else { return nil }
+        // The first byte of a BIT STRING counts its unused bits.
+        return (bits.lowerBound + 1)..<bits.upperBound
     }
 
     // MARK: Queries
@@ -266,13 +267,15 @@ public final class MySQLDriver: Driver {
                 let warnings = Int(r.intLE(2))
                 var message = "\(affected) row\(affected == 1 ? "" : "s") affected"
                 if warnings > 0 { message += ", \(warnings) warning\(warnings == 1 ? "" : "s")" }
-                results.append(QueryResult(affectedRows: Int(affected), message: message))
+                results.append(QueryResult(affectedRows: affected, message: message))
                 if status & 0x08 == 0 { return results }
             case 0xFB:
                 throw DatabaseError("LOAD DATA LOCAL isn't supported in Maben Base.")
             default:
                 var r = ByteReader(first)
-                let count = Int(readLenenc(&r))
+                let count = readLenenc(&r)
+                // MySQL stops at 4,096 columns; a count far past that is a broken reply, not a result to make room for.
+                guard count <= 65_535 else { throw DatabaseError.malformedReply("A result with \(count) columns.") }
                 var columns: [ResultColumn] = []
                 for _ in 0..<count {
                     var c = ByteReader(try readPacket())
@@ -307,8 +310,7 @@ public final class MySQLDriver: Driver {
                     row.reserveCapacity(count)
                     for i in 0..<count {
                         if r.pos < r.bytes.count && r.bytes[r.pos] == 0xFB { _ = r.byte(); row.append(nil); continue }
-                        let len = Int(readLenenc(&r))
-                        let bytes = r.take(len)
+                        let bytes = r.take(readLenenc(&r))
                         if columns[i].isBinary {
                             row.append("0x" + bytes.map { String(format: "%02X", $0) }.joined())
                         } else {
@@ -338,20 +340,20 @@ public final class MySQLDriver: Driver {
         return b
     }
 
-    private func readLenenc(_ r: inout ByteReader) -> UInt64 {
+    /// A length-encoded integer. They count bytes and rows, so one past Int.max is clamped, not trusted.
+    private func readLenenc(_ r: inout ByteReader) -> Int {
         let first = r.byte()
         switch first {
-        case 0xFC: return r.intLE(2)
-        case 0xFD: return r.intLE(3)
-        case 0xFE: return r.intLE(8)
-        default: return UInt64(first)
+        case 0xFC: return Int(r.intLE(2))
+        case 0xFD: return Int(r.intLE(3))
+        case 0xFE: return Int(clamping: r.intLE(8))
+        default: return Int(first)
         }
     }
 
     private func readLenencString(_ r: inout ByteReader) -> String? {
         if r.pos < r.bytes.count && r.bytes[r.pos] == 0xFB { _ = r.byte(); return nil }
-        let n = Int(readLenenc(&r))
-        return String(decoding: r.take(n), as: UTF8.self)
+        return String(decoding: r.take(readLenenc(&r)), as: UTF8.self)
     }
 
     static func typeName(_ type: UInt8, binary: Bool) -> String {
@@ -499,7 +501,7 @@ public final class MySQLDriver: Driver {
         switch object.kind {
         case .function:
             for kind in ["FUNCTION", "PROCEDURE"] {
-                if let r = try? execute("SHOW CREATE \(kind) \(dialect.quote(object.name))").first?.rows.first, r.count > 2 { return r[2] }
+                if let r = try? rows("SHOW CREATE \(kind) \(dialect.quote(object.name))").first, r.count > 2 { return r[2] }
             }
             return nil
         case .view:

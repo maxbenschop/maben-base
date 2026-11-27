@@ -13,24 +13,14 @@ enum JWT {
         Data(base64Encoded: pem.split(whereSeparator: \.isNewline).filter { !$0.hasPrefix("-----") }.joined())
     }
 
-    /// A PKCS#8 PrivateKeyInfo's inner RSAPrivateKey (Security wants PKCS#1).
+    /// A PKCS#8 PrivateKeyInfo's inner RSAPrivateKey (Security wants PKCS#1). A key that is already PKCS#1,
+    /// or isn't a key at all, comes back as it is, for Security to accept or refuse.
     static func pkcs1(_ der: [UInt8]) -> [UInt8] {
-        var i = 0
-        func length() -> Int {
-            var len = Int(der[i]); i += 1
-            if len & 0x80 != 0 { let n = len & 0x7F; len = 0; for _ in 0..<n { len = len << 8 | Int(der[i]); i += 1 } }
-            return len
-        }
-        guard der.count > 26, der[0] == 0x30 else { return der }
-        i = 1; _ = length()
-        guard der[i] == 0x02 else { return der }  // version
-        i += 1; i += length()
-        guard i < der.count, der[i] == 0x30 else { return der }  // PKCS#1 starts with the modulus INTEGER, not a SEQUENCE
-        i += 1; i += length()
-        guard i < der.count, der[i] == 0x04 else { return der }
-        i += 1
-        let n = length()
-        return Array(der[i..<min(der.count, i + n)])
+        var r = DER(der)
+        // SEQUENCE { INTEGER version, SEQUENCE algorithm, OCTET STRING { RSAPrivateKey } }
+        // PKCS#1 has the modulus (an INTEGER) where PKCS#8 has the algorithm (a SEQUENCE).
+        guard r.enter(0x30), r.element(0x02) != nil, r.element(0x30) != nil, let key = r.element(0x04) else { return der }
+        return Array(der[key])
     }
 
     static func privateKey(_ pem: String) throws -> SecKey {
@@ -92,7 +82,8 @@ public final class BigQueryDriver: Driver {
         self.project = project
         self.keyFile = (keyFile as NSString).expandingTildeInPath
         emulator = !(endpoint ?? "").isEmpty
-        base = URL(string: (endpoint?.isEmpty == false ? endpoint! : "https://bigquery.googleapis.com") + "/bigquery/v2/projects/\(project)")!
+        let root = try HTTPClient.tokenEndpoint(endpoint?.isEmpty == false ? endpoint! : "https://bigquery.googleapis.com")
+        base = root.appendingPathComponent("bigquery/v2/projects").appendingPathComponent(project)
         currentDatabase = dataset.isEmpty ? nil : dataset
         _ = try execute("SELECT 1")
     }
@@ -129,7 +120,7 @@ public final class BigQueryDriver: Driver {
         let jwt = try JWT.sign(["iss": email, "scope": "https://www.googleapis.com/auth/bigquery", "aud": tokenURI, "iat": now, "exp": now + 3600],
                                key: try JWT.privateKey(pem))
         let body = "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=\(jwt)"
-        let r = try http.send(URL(string: tokenURI)!, headers: ["Content-Type": "application/x-www-form-urlencoded"], body: Data(body.utf8))
+        let r = try http.send(try HTTPClient.tokenEndpoint(tokenURI), headers: ["Content-Type": "application/x-www-form-urlencoded"], body: Data(body.utf8))
         guard let reply = try? JSONSerialization.jsonObject(with: r.body) as? [String: Any], let value = reply["access_token"] as? String else {
             throw DatabaseError("Google refused the service account key.", detail: r.text)
         }
@@ -138,11 +129,12 @@ public final class BigQueryDriver: Driver {
     }
 
     private func call(_ path: String, method: String = "GET", body: [String: Any]? = nil, query: [URLQueryItem] = []) throws -> [String: Any] {
-        var c = URLComponents(url: path.isEmpty ? base : base.appendingPathComponent(path), resolvingAgainstBaseURL: false)!
-        if !query.isEmpty { c.queryItems = query }
+        var c = URLComponents(url: path.isEmpty ? base : base.appendingPathComponent(path), resolvingAgainstBaseURL: false)
+        if !query.isEmpty { c?.queryItems = query }
+        guard let url = c?.url else { throw DatabaseError("\(path) isn't a valid address.") }
         var headers: [String: String] = [:]
         if let t = try accessToken() { headers["Authorization"] = "Bearer \(t)" }
-        let (status, json) = try http.json(c.url!, method: method, headers: headers, body: body)
+        let (status, json) = try http.json(url, method: method, headers: headers, body: body)
         let object = json as? [String: Any] ?? [:]
         guard (200..<300).contains(status) else {
             let e = object["error"] as? [String: Any]
@@ -371,9 +363,10 @@ public final class SnowflakeDriver: Driver {
         let partitions = (meta["partitionInfo"] as? [Any])?.count ?? 1
         var p = 1
         while p < partitions && rows.count < rowLimit, let handle {
-            var c = URLComponents(url: base.appendingPathComponent(handle), resolvingAgainstBaseURL: false)!
-            c.queryItems = [URLQueryItem(name: "partition", value: String(p))]
-            let (_, more) = try call(c.url!)
+            var c = URLComponents(url: base.appendingPathComponent(handle), resolvingAgainstBaseURL: false)
+            c?.queryItems = [URLQueryItem(name: "partition", value: String(p))]
+            guard let url = c?.url else { break }
+            let (_, more) = try call(url)
             rows += (more["data"] as? [[Any]] ?? []).map { $0.map { $0 is NSNull ? nil : $0 as? String ?? "\($0)" } }
             p += 1
         }
@@ -383,7 +376,9 @@ public final class SnowflakeDriver: Driver {
             let n = rows.first?.compactMap { $0.flatMap(Int.init) }.reduce(0, +) ?? 0
             return QueryResult(affectedRows: n, message: "\(n) rows affected")
         }
-        return QueryResult(columns: columns, rows: Array(rows.prefix(rowLimit)), message: "\(min(rows.count, rowLimit)) rows", truncated: total > rowLimit)
+        var answer = QueryResult(columns: columns, rows: Array(rows.prefix(rowLimit)), message: "\(min(rows.count, rowLimit)) rows", truncated: total > rowLimit)
+        answer.squareUp()
+        return answer
     }
 
     public func execute(_ sql: String, rowLimit: Int) throws -> [QueryResult] {
@@ -413,7 +408,7 @@ public final class SnowflakeDriver: Driver {
 
     private func show(_ sql: String, column: String) throws -> [String] {
         guard let r = try execute(sql).first, let i = r.columns.firstIndex(where: { $0.name.lowercased() == column }) else { return [] }
-        return r.rows.compactMap { $0[i] }
+        return r.rows.compactMap { $0[safe: i] ?? nil }
     }
 
     public func databases() throws -> [String] { try show("SHOW TERSE DATABASES", column: "name").sorted() }
@@ -478,7 +473,8 @@ public final class D1Driver: Driver, SQLiteSchema {
         self.account = account
         self.token = token
         currentDatabase = database
-        base = URL(string: (endpoint ?? "https://api.cloudflare.com/client/v4") + "/accounts/\(account)/d1/database/\(database)")!
+        base = try HTTPClient.tokenEndpoint(endpoint?.isEmpty == false ? endpoint! : "https://api.cloudflare.com/client/v4")
+            .appendingPathComponent("accounts").appendingPathComponent(account).appendingPathComponent("d1/database").appendingPathComponent(database)
         serverVersion = "D1 · SQLite " + (try rows("SELECT sqlite_version()").first?[0] ?? "")
     }
 
@@ -498,8 +494,10 @@ public final class D1Driver: Driver, SQLiteSchema {
                 return v as? String ?? "\(v)"
             } }
             let changes = (r["meta"] as? [String: Any])?["changes"] as? Int
-            return QueryResult(columns: cols.map { ResultColumn(name: $0, typeName: "") }, rows: Array(rows),
-                               affectedRows: cols.isEmpty ? changes : nil, message: cols.isEmpty ? "\(changes ?? 0) rows affected" : "\(rows.count) rows")
+            var answer = QueryResult(columns: cols.map { ResultColumn(name: $0, typeName: "") }, rows: Array(rows),
+                                     affectedRows: cols.isEmpty ? changes : nil, message: cols.isEmpty ? "\(changes ?? 0) rows affected" : "\(rows.count) rows")
+            answer.squareUp()
+            return answer
         }
     }
 

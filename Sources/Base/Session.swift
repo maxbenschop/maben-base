@@ -9,16 +9,37 @@ struct Secrets: Sendable {
     var password: String?
     var ssh: String?
     var certificate: String?
+    /// Secrets that are saved for this connection's ID but for another server, so they weren't handed over.
+    var withheld: Set<SecretSlot> = []
 
-    static func load(_ id: UUID) -> Secrets {
-        Secrets(password: Keychain.password(account: id.uuidString), ssh: Keychain.password(account: id.uuidString + ".ssh"),
-                certificate: Keychain.password(account: id.uuidString + ".p12"))
+    init(password: String? = nil, ssh: String? = nil, certificate: String? = nil) {
+        self.password = password
+        self.ssh = ssh
+        self.certificate = certificate
     }
 
-    func save(_ id: UUID) {
-        Keychain.set(password, account: id.uuidString)
-        Keychain.set(ssh, account: id.uuidString + ".ssh")
-        Keychain.set(certificate, account: id.uuidString + ".p12")
+    /// Each secret is only read when it was saved for what the connection points at now (its host, port and
+    /// user): a connection that came from a file or from sync with a known ID but another server gets nothing.
+    static func load(_ config: ConnectionConfig) -> Secrets {
+        var out = Secrets()
+        func read(_ slot: SecretSlot) -> String? {
+            switch Keychain.lookup(account: config.secretAccount(slot), binding: config.secretBinding(slot)) {
+            case .found(let secret): return secret
+            case .elsewhere: out.withheld.insert(slot); return nil
+            case .none: return nil
+            }
+        }
+        out.password = read(.password)
+        out.ssh = read(.ssh)
+        out.certificate = read(.certificate)
+        return out
+    }
+
+    /// Saves the secrets for what `config` points at now.
+    func save(_ config: ConnectionConfig) {
+        Keychain.set(password, account: config.secretAccount(.password), binding: config.secretBinding(.password))
+        Keychain.set(ssh, account: config.secretAccount(.ssh), binding: config.secretBinding(.ssh))
+        Keychain.set(certificate, account: config.secretAccount(.certificate), binding: config.secretBinding(.certificate))
     }
 }
 

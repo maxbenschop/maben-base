@@ -14,21 +14,31 @@ public final class PostgresDriver: Driver {
     private let user: String
     private let password: String
     private let tls: TLSOptions
+    private let readOnly: Bool
     private var processID: Int32 = 0
     private var secretKey: Int32 = 0
     private var typeNames: [Int32: String] = PostgresDriver.builtinTypes
     private let cancelLock = NSLock()
 
-    public init(host: String, port: Int, user: String, password: String, database: String, tls: TLSOptions) throws {
+    public init(host: String, port: Int, user: String, password: String, database: String, tls: TLSOptions, readOnly: Bool = false) throws {
         self.host = host
         self.port = port
         self.user = user
         self.password = password
         self.tls = tls
+        self.readOnly = readOnly
         socket = try Self.connect(host: host, port: port, tls: tls)
         try startup(database: database)
         currentDatabase = database
+        applyReadOnly()
         loadTypeNames()
+    }
+
+    /// A read-only connection also asks the server to refuse writes: every transaction of the session starts
+    /// read-only. The app's own check of what you run stays in front of it; servers that don't know the
+    /// setting just keep that check.
+    private func applyReadOnly() {
+        if readOnly { _ = try? execute("SET default_transaction_read_only = on") }
     }
 
     /// A host starting with / is a Unix socket: a directory (Postgres puts .s.PGSQL.<port> in it) or the socket itself.
@@ -49,10 +59,11 @@ public final class PostgresDriver: Driver {
             try socket.write(request)
             let answer = try socket.readByte()
             if answer == UInt8(ascii: "S") {
-                socket.startTLS(tls)
-            } else if tls.mode != .prefer {
+                // Runs the handshake, and with TLS Verify checks the certificate, before the startup message goes out.
+                try socket.startTLS(tls)
+            } else if !PlainText.mayFallBack(host: host, mode: tls.mode) {
                 socket.close()
-                throw DatabaseError("The server doesn't accept TLS connections.", detail: "Set TLS to Prefer or Off for this connection.")
+                throw PlainText.noTLS(host: host, mode: tls.mode)
             }
         }
         return socket
@@ -72,7 +83,7 @@ public final class PostgresDriver: Driver {
         let type = try socket.readByte()
         var r = ByteReader(try socket.read(4))
         let length = Int(r.int32BE()) - 4
-        guard length >= 0, length < 1 << 30 else { throw DatabaseError("The server sent a message this app doesn't understand.") }
+        guard length >= 0, length < Socket.maxMessage else { throw DatabaseError.malformedReply() }
         return (type, try socket.read(length))
     }
 
@@ -113,6 +124,10 @@ public final class PostgresDriver: Driver {
                 switch code {
                 case 0: break
                 case 3:
+                    // The password itself, readable by the server and by anyone on the path.
+                    guard PlainText.maySendPassword(encrypted: socket.isEncrypted, host: host, mode: tls.mode) else {
+                        throw PlainText.passwordRefused(host: host)
+                    }
                     try send(UInt8(ascii: "p"), { var b = [UInt8](); b.appendCString(password); return b }())
                 case 5:
                     let salt = Array(r.take(4))
@@ -178,7 +193,7 @@ public final class PostgresDriver: Driver {
             switch type {
             case UInt8(ascii: "T"):
                 var r = ByteReader(msg)
-                let count = Int(r.int16BE())
+                let count = Int(UInt16(bitPattern: r.int16BE()))
                 var columns: [ResultColumn] = []
                 for _ in 0..<count {
                     let name = r.cString()
@@ -193,7 +208,9 @@ public final class PostgresDriver: Driver {
                 guard current != nil else { continue }
                 if current!.rows.count >= rowLimit { current!.truncated = true; continue }
                 var r = ByteReader(msg)
-                let count = Int(r.int16BE())
+                let count = Int(UInt16(bitPattern: r.int16BE()))
+                // A row always has one value per column; anything else isn't Postgres talking.
+                guard count == current!.columns.count else { throw DatabaseError.malformedReply("A row with \(count) values for \(current!.columns.count) columns.") }
                 var row: [String?] = []
                 row.reserveCapacity(count)
                 for _ in 0..<count {
@@ -280,6 +297,7 @@ public final class PostgresDriver: Driver {
         try? old.write(terminate)
         old.close()
         currentDatabase = database
+        applyReadOnly()
         typeNames = Self.builtinTypes
         loadTypeNames()
     }
@@ -287,7 +305,7 @@ public final class PostgresDriver: Driver {
     public func schemas() throws -> [String] {
         try rows("""
             SELECT nspname FROM pg_namespace
-            WHERE nspname NOT LIKE 'pg\\_%' ESCAPE '\\' AND nspname <> 'information_schema'
+            WHERE nspname NOT LIKE 'pg!_%' ESCAPE '!' AND nspname <> 'information_schema'
             ORDER BY nspname = 'public' DESC, nspname
             """).compactMap { $0[0] }
     }
@@ -453,7 +471,7 @@ private struct SCRAM {
         }
         guard let r = fields["r"], r.hasPrefix(nonce), let s = fields["s"], let salt = Data(base64Encoded: s),
               let i = fields["i"].flatMap({ Int($0) }) else { throw DatabaseError("The server's SCRAM message was malformed.") }
-        let salted = Crypto.pbkdf2SHA256(password: Array(SASLprep(password).utf8), salt: Array(salt), iterations: i)
+        let salted = try Crypto.pbkdf2SHA256(password: Array(SASLprep(password).utf8), salt: Array(salt), iterations: i)
         let clientKey = Crypto.hmacSHA256(key: salted, Array("Client Key".utf8))
         let storedKey = Crypto.sha256(clientKey)
         let withoutProof = "c=biws,r=\(r)"

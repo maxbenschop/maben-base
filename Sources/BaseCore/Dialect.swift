@@ -9,7 +9,11 @@ public struct Dialect: Sendable {
 
     public func quote(_ identifier: String) -> String {
         switch family {
-        case .mysql, .bigquery, .clickhouse: "`" + identifier.replacingOccurrences(of: "`", with: "``") + "`"
+        case .mysql: "`" + identifier.replacingOccurrences(of: "`", with: "``") + "`"
+        // Inside backticks, ClickHouse and BigQuery read a backslash as an escape, as they do in strings:
+        // a name ending in one would otherwise swallow the closing backtick.
+        case .bigquery, .clickhouse:
+            "`" + identifier.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "`", with: "\\`") + "`"
         case .tsql: "[" + identifier.replacingOccurrences(of: "]", with: "]]") + "]"
         case .mongo, .redis: identifier
         default: "\"" + identifier.replacingOccurrences(of: "\"", with: "\"\"") + "\""
@@ -31,7 +35,8 @@ public struct Dialect: Sendable {
         guard let value else { return "NULL" }
         if binary, let hex = Self.hexDigits(value) {
             switch family {
-            case .postgres: return "'\\x\(hex)'"
+            // E'' so the backslash means the same whatever standard_conforming_strings is.
+            case .postgres: return "E'\\\\x\(hex)'"
             case .tsql, .cql: return "0x\(hex)"
             case .oracle: return "HEXTORAW('\(hex)')"
             case .snowflake: return "TO_BINARY('\(hex)', 'HEX')"
@@ -52,23 +57,54 @@ public struct Dialect: Sendable {
             if family == .cql, ["list<", "set<", "map<", "tuple<", "frozen<", "udt"].contains(where: { t.hasPrefix($0) }),
                let first = trimmed.first, "[{(".contains(first) { return trimmed }
         }
+        let doubled = value.replacingOccurrences(of: "'", with: "''")
         switch family {
-        case .mysql, .clickhouse:
-            // Backslash is an escape inside strings here.
-            return "'" + value.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "'", with: "''") + "'"
+        case .mysql, .clickhouse, .snowflake:
+            // Backslash is an escape inside strings here: left alone, a value ending in one would take the
+            // closing quote with it and the rest of the statement would be read as part of the value.
+            return "'" + doubled.replacingOccurrences(of: "\\", with: "\\\\") + "'"
+        case .postgres:
+            // A plain '…' takes backslashes as they are only while standard_conforming_strings is on, which
+            // a server or a session can turn off. E'…' reads the same either way, so it is used whenever
+            // the value has a backslash.
+            return value.contains("\\") ? "E'" + doubled.replacingOccurrences(of: "\\", with: "\\\\") + "'" : "'" + doubled + "'"
         case .bigquery:
             return "'" + value.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "'", with: "\\'")
-                .replacingOccurrences(of: "\n", with: "\\n") + "'"
+                .replacingOccurrences(of: "\n", with: "\\n").replacingOccurrences(of: "\r", with: "\\r") + "'"
         case .tsql:
-            return "N'" + value.replacingOccurrences(of: "'", with: "''") + "'"
+            return "N'" + doubled + "'"
+        case .oracle:
+            return Self.oracleLiteral(value)
         case .mongo:
             return MongoText.literal(value)
         case .redis:
             return RedisText.quote(value)
         default:
-            // Postgres (standard_conforming_strings), SQLite, Oracle, Snowflake, DuckDB, CQL: only quotes are doubled.
-            return "'" + value.replacingOccurrences(of: "'", with: "''") + "'"
+            // SQLite, DuckDB, CQL: a backslash is only a backslash, so only quotes are doubled.
+            return "'" + doubled + "'"
         }
+    }
+
+    /// An Oracle string with its line breaks and other control characters written as CHR(n), joined with ||.
+    /// Oracle statements go to SQL*Plus, which reads a line at a time and has commands of its own: a value
+    /// with a line break in it must not put a line of its own in front of SQL*Plus.
+    static func oracleLiteral(_ value: String) -> String {
+        var parts: [String] = []
+        var run = String.UnicodeScalarView()
+        func flush() {
+            if !run.isEmpty { parts.append("'" + String(run).replacingOccurrences(of: "'", with: "''") + "'") }
+            run = String.UnicodeScalarView()
+        }
+        for scalar in value.unicodeScalars {
+            if ConnectionConfig.isControl(scalar) {
+                flush()
+                parts.append(scalar.value < 0x80 ? "CHR(\(scalar.value))" : String(format: "UNISTR('\\%04X')", scalar.value))
+            } else {
+                run.append(scalar)
+            }
+        }
+        flush()
+        return parts.isEmpty ? "''" : parts.joined(separator: " || ")
     }
 
     /// "0xABCD" or "\xabcd" → "ABCD", if the text is hex.
@@ -139,7 +175,8 @@ public struct Dialect: Sendable {
             }
         }
         let likeOp = [.postgres, .duckdb, .snowflake, .clickhouse].contains(family) ? "ILIKE" : "LIKE"
-        let escapeClause = [.mysql, .bigquery, .clickhouse, .cql].contains(family) ? "" : " ESCAPE '\\'"
+        // The one-backslash string, spelled the way this engine spells it.
+        let escapeClause = [.mysql, .bigquery, .clickhouse, .cql].contains(family) ? "" : " ESCAPE " + literal("\\")
         guard let column else { return nil }
         let lit = { (v: String) in literal(v, type: type) }
         // "contains" ignores case everywhere: Oracle's and BigQuery's LIKE don't, so both sides go upper case.

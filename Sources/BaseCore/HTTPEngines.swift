@@ -16,21 +16,21 @@ public final class ClickHouseDriver: Driver {
 
     public init(host: String, port: Int, user: String, password: String, database: String, tls: TLSOptions) throws {
         http = HTTPClient(tls: tls, host: host)
-        guard let base = HTTPClient.baseURL(host: host, port: port, secure: tls.mode != .off) else { throw DatabaseError("\(host) isn't a valid address.") }
-        self.base = base
+        base = try HTTPClient.endpoint(host: host, port: port, tls: tls.mode)
         headers = ["X-ClickHouse-User": user.isEmpty ? "default" : user, "X-ClickHouse-Key": password]
         currentDatabase = database.isEmpty ? "default" : database
         serverVersion = try rows("SELECT version()").first?[0] ?? ""
     }
 
     private func request(_ sql: String) throws -> (QueryResult, HTTPClient.Response) {
-        var c = URLComponents(url: base, resolvingAgainstBaseURL: false)!
         let id = UUID().uuidString
         queryID = id
-        c.queryItems = [URLQueryItem(name: "database", value: currentDatabase), URLQueryItem(name: "query_id", value: id),
-                        URLQueryItem(name: "default_format", value: "TabSeparatedWithNamesAndTypes"),
-                        URLQueryItem(name: "send_progress_in_http_headers", value: "0")]
-        let r = try http.send(c.url!, headers: headers, body: Data(sql.utf8))
+        var c = URLComponents(url: base, resolvingAgainstBaseURL: false)
+        c?.queryItems = [URLQueryItem(name: "database", value: currentDatabase), URLQueryItem(name: "query_id", value: id),
+                         URLQueryItem(name: "default_format", value: "TabSeparatedWithNamesAndTypes"),
+                         URLQueryItem(name: "send_progress_in_http_headers", value: "0")]
+        guard let url = c?.url else { throw DatabaseError("\(base.absoluteString) isn't a valid address.") }
+        let r = try http.send(url, headers: headers, body: Data(sql.utf8))
         guard r.status == 200 else {
             let text = r.text.trimmingCharacters(in: .whitespacesAndNewlines)
             let code = text.range(of: #"Code: (\d+)"#, options: .regularExpression).map { String(text[$0].dropFirst(6)) }
@@ -62,7 +62,9 @@ public final class ClickHouseDriver: Driver {
         let types = lines[1].split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
         let columns = zip(names, types).map { ResultColumn(name: $0, typeName: $1) }
         let rows = lines.dropFirst(2).map { $0.split(separator: "\t", omittingEmptySubsequences: false).map(unescape) }
-        return QueryResult(columns: columns, rows: Array(rows), message: "\(rows.count) row\(rows.count == 1 ? "" : "s")")
+        var result = QueryResult(columns: columns, rows: Array(rows), message: "\(rows.count) row\(rows.count == 1 ? "" : "s")")
+        result.squareUp()
+        return result
     }
 
     public func execute(_ sql: String, rowLimit: Int) throws -> [QueryResult] {
@@ -90,9 +92,9 @@ public final class ClickHouseDriver: Driver {
         http.cancel()
         guard let id = queryID else { return }
         DispatchQueue.global().async { [base, headers, http] in
-            var c = URLComponents(url: base, resolvingAgainstBaseURL: false)!
-            c.queryItems = [URLQueryItem(name: "query", value: "KILL QUERY WHERE query_id = '\(id)'")]
-            _ = try? http.send(c.url!, headers: headers)
+            var c = URLComponents(url: base, resolvingAgainstBaseURL: false)
+            c?.queryItems = [URLQueryItem(name: "query", value: "KILL QUERY WHERE query_id = '\(id)'")]
+            if let url = c?.url { _ = try? http.send(url, headers: headers) }
         }
     }
 
@@ -161,12 +163,7 @@ public final class LibSQLDriver: Driver, SQLiteSchema {
 
     public init(host: String, port: Int, token: String, tls: TLSOptions) throws {
         http = HTTPClient(tls: tls, host: host)
-        var h = host
-        if h.hasPrefix("libsql://") { h = "https://" + h.dropFirst(9) }
-        guard let base = HTTPClient.baseURL(host: h, port: port, secure: tls.mode != .off || h.hasPrefix("https")) else {
-            throw DatabaseError("\(host) isn't a valid address.")
-        }
-        self.base = base
+        base = try HTTPClient.endpoint(host: host, port: port, tls: tls.mode)
         self.token = token
         serverVersion = "libSQL " + (try rows("SELECT sqlite_version()").first?[0] ?? "")
     }
@@ -179,7 +176,8 @@ public final class LibSQLDriver: Driver, SQLiteSchema {
         if status == 401 || status == 403 { throw DatabaseError("libSQL refused the token.", detail: object["error"] as? String) }
         guard status == 200 else { throw DatabaseError((object["error"] as? String) ?? (object["message"] as? String) ?? "HTTP \(status)") }
         baton = object["baton"] as? String
-        if let b = object["base_url"] as? String, let u = URL(string: b) { base = u }
+        // The token goes with every request, so the server may only move the session within its own domain.
+        if let b = object["base_url"] as? String, let u = URL(string: b), HTTPClient.mayMove(from: base, to: u) { base = u }
         return object["results"] as? [Any] ?? []
     }
 
@@ -213,14 +211,16 @@ public final class LibSQLDriver: Driver, SQLiteSchema {
             }
             var columns = cols
             var rows = (result["rows"] as? [[Any]] ?? []).prefix(rowLimit == .max ? .max : rowLimit + 1).map { $0.map(Self.value) }
-            for (i, c) in columns.enumerated() where rows.contains(where: { $0[i]?.hasPrefix("0x") == true }) && c.typeName.contains("blob") {
+            for (i, c) in columns.enumerated() where rows.contains(where: { ($0[safe: i] ?? nil)?.hasPrefix("0x") == true }) && c.typeName.contains("blob") {
                 columns[i].isBinary = true
             }
             let truncated = rows.count > rowLimit
             if truncated { rows.removeLast() }
             let affected = result["affected_row_count"] as? Int
-            out.append(QueryResult(columns: columns, rows: Array(rows), affectedRows: columns.isEmpty ? affected : nil,
-                                   message: columns.isEmpty ? "\(affected ?? 0) rows affected" : "\(rows.count) rows", truncated: truncated))
+            var answer = QueryResult(columns: columns, rows: Array(rows), affectedRows: columns.isEmpty ? affected : nil,
+                                     message: columns.isEmpty ? "\(affected ?? 0) rows affected" : "\(rows.count) rows", truncated: truncated)
+            answer.squareUp()
+            out.append(answer)
         }
         return out
     }

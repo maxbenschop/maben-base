@@ -74,19 +74,30 @@ public enum Admin {
                 SELECT rolname, rolcanlogin, rolsuper,
                        concat_ws(', ', CASE WHEN rolcreatedb THEN 'create databases' END, CASE WHEN rolcreaterole THEN 'create roles' END,
                                  CASE WHEN rolreplication THEN 'replication' END, CASE WHEN rolvaliduntil IS NOT NULL THEN 'valid until ' || rolvaliduntil::date END)
-                FROM pg_roles WHERE rolname NOT LIKE 'pg\\_%' ESCAPE '\\' ORDER BY rolcanlogin DESC, rolname
+                FROM pg_roles WHERE rolname NOT LIKE 'pg!_%' ESCAPE '!' ORDER BY rolcanlogin DESC, rolname
                 """).map { r in
                 User(id: r[0] ?? "", name: r[0] ?? "", host: nil, canLogin: r[1] == "t", superuser: r[2] == "t", detail: r[3] ?? "")
             }
         case .mysql:
             return try d.rows("SELECT User, Host, Super_priv FROM mysql.user ORDER BY User, Host").map { r in
                 let name = r[0] ?? "", host = r[1] ?? "%"
-                return User(id: "'\(name)'@'\(host)'", name: name, host: host, canLogin: true, superuser: r[2] == "Y", detail: "")
+                return User(id: mysqlAccount(name: name, host: host), name: name, host: host, canLogin: true, superuser: r[2] == "Y", detail: "")
             }
         default:
             return []
         }
     }
+
+    /// 'user'@'host' as MySQL statements take it, each part a quoted string. Account names come from the
+    /// server and can hold quotes and backslashes; written out bare they would end the name and add SQL of
+    /// their own to GRANT, ALTER USER and DROP USER.
+    static func mysqlAccount(name: String, host: String) -> String {
+        let d = Dialect(kind: .mysql)
+        return "\(d.literal(name))@\(d.literal(host.isEmpty ? "%" : host))"
+    }
+
+    /// Always made from the name and host, never taken from text that was put together earlier.
+    private static func account(_ user: User) -> String { mysqlAccount(name: user.name, host: user.host ?? "%") }
 
     /// What a user may do, one line per grant.
     public static func grants(_ d: Driver, user: User) throws -> [String] {
@@ -103,7 +114,7 @@ public enum Admin {
                 """).compactMap { $0[0] }
             return lines
         case .mysql:
-            return try d.rows("SHOW GRANTS FOR \(user.id)").compactMap { $0[0] }
+            return try d.rows("SHOW GRANTS FOR \(account(user))").compactMap { $0[0] }
         default:
             return []
         }
@@ -120,7 +131,7 @@ public enum Admin {
         case .postgres:
             return ["CREATE ROLE \(d.quote(name)) LOGIN PASSWORD \(d.literal(password))\(superuser ? " SUPERUSER" : "")"]
         default:
-            let account = "\(d.literal(name))@\(d.literal(host.isEmpty ? "%" : host))"
+            let account = mysqlAccount(name: name, host: host)
             var out = ["CREATE USER \(account) IDENTIFIED BY \(d.literal(password))"]
             if superuser { out.append("GRANT ALL PRIVILEGES ON *.* TO \(account) WITH GRANT OPTION") }
             return out
@@ -130,13 +141,13 @@ public enum Admin {
     public static func setPassword(_ kind: DatabaseKind, user: User, password: String) -> String {
         let d = Dialect(kind: kind)
         return kind == .postgres ? "ALTER ROLE \(d.quote(user.name)) PASSWORD \(d.literal(password))"
-                                 : "ALTER USER \(user.id) IDENTIFIED BY \(d.literal(password))"
+                                 : "ALTER USER \(account(user)) IDENTIFIED BY \(d.literal(password))"
     }
 
     /// Postgres won't drop a role that owns things or holds privileges, so whatever it owns in this database
     /// goes to you first and its privileges are removed; then the role goes. (Other databases need the same there.)
     public static func dropUser(_ kind: DatabaseKind, user: User) -> [String] {
-        guard kind == .postgres else { return ["DROP USER \(user.id)"] }
+        guard kind == .postgres else { return ["DROP USER \(account(user))"] }
         let name = Dialect(kind: kind).quote(user.name)
         return ["REASSIGN OWNED BY \(name) TO CURRENT_USER", "DROP OWNED BY \(name)", "DROP ROLE \(name)"]
     }
@@ -151,7 +162,7 @@ public enum Admin {
         } else {
             target = "\(d.quote(container)).\(table.map(d.quote) ?? "*")"
         }
-        let who = kind == .postgres ? d.quote(user.name) : user.id
+        let who = kind == .postgres ? d.quote(user.name) : account(user)
         return revoke ? "REVOKE \(what) ON \(target) FROM \(who)" : "GRANT \(what) ON \(target) TO \(who)"
     }
 
@@ -180,9 +191,9 @@ public enum Admin {
                        pg_database_size(current_database())
                 FROM pg_stat_database
                 """).first {
-                let v = row.map { $0.flatMap(Double.init) ?? 0 }
-                r.gauges = ["connections": v[0], "active": v[1], "maxConnections": v[2], "waitingLocks": v[3], "longestQuery": v[4], "databaseSize": v[11]]
-                r.counters = ["commits": v[5], "rollbacks": v[6], "cacheHits": v[7], "diskReads": v[8], "rowsRead": v[9], "rowsWritten": v[10]]
+                func v(_ i: Int) -> Double { row[i].flatMap(Double.init) ?? 0 }
+                r.gauges = ["connections": v(0), "active": v(1), "maxConnections": v(2), "waitingLocks": v(3), "longestQuery": v(4), "databaseSize": v(11)]
+                r.counters = ["commits": v(5), "rollbacks": v(6), "cacheHits": v(7), "diskReads": v(8), "rowsRead": v(9), "rowsWritten": v(10)]
             }
         case .mysql:
             var status: [String: Double] = [:]

@@ -32,15 +32,53 @@ enum ExportFormat: String, CaseIterable, Hashable {
         }
     }
 
-    func data(columns: [ResultColumn], rows: [[String?]], name: String, table: TableRef?, dialect: Dialect) -> Data {
+    /// `protectFormulas` is the CSV option (see `CSVOptions`); the other formats don't have formulas to run.
+    func data(columns: [ResultColumn], rows: [[String?]], name: String, table: TableRef?, dialect: Dialect, protectFormulas: Bool = false) -> Data {
         switch self {
-        case .csv: Data(Export.csv(columns: columns, rows: rows).utf8)
+        case .csv: Data(Export.csv(columns: columns, rows: rows, protectFormulas: protectFormulas).utf8)
         case .json: Data(Export.json(columns: columns, rows: rows).utf8)
         case .xlsx: Export.xlsx([.init(name: name, columns: columns, rows: rows)])
         case .markdown: Data(Export.markdown(columns: columns, rows: rows).utf8)
         case .sql: Data((dialect.insertStatements(table: table ?? TableRef(schema: nil, name: name), columns: columns, rows: rows)
                          .joined(separator: "\n") + "\n").utf8)
         }
+    }
+}
+
+/// The one choice a CSV file has. A spreadsheet runs a cell that starts with = + - or @ as a formula, and a
+/// value in a database can be written to do harm that way, so files are written with such text marked as
+/// text unless you turn it off (to get the values exactly as they are, for another program to read).
+@MainActor
+enum CSVOptions {
+    static let title = "Protect against spreadsheet formulas"
+    static let help = "Puts an apostrophe in front of text that starts with =, +, - or @, so Excel and Numbers show it instead of running it. Numbers stay as they are. Turn it off to write every value exactly as it is."
+
+    /// On until you turn it off; the choice is remembered.
+    static var protectFormulas: Bool {
+        get { UserDefaults.standard.object(forKey: "export.csvProtectFormulas") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "export.csvProtectFormulas") }
+    }
+
+    static func checkbox() -> NSButton {
+        let box = NSButton(checkboxWithTitle: title, target: nil, action: nil)
+        box.state = protectFormulas ? .on : .off
+        box.toolTip = help
+        return box
+    }
+
+    /// The checkbox with some room around it, for under a save panel.
+    static func accessory(_ box: NSButton) -> NSView {
+        box.sizeToFit()
+        let view = NSView(frame: NSRect(x: 0, y: 0, width: box.frame.width + 40, height: box.frame.height + 20))
+        box.setFrameOrigin(NSPoint(x: 20, y: 10))
+        view.addSubview(box)
+        return view
+    }
+
+    /// What was chosen in the panel, remembered for next time.
+    static func read(_ box: NSButton) -> Bool {
+        protectFormulas = box.state == .on
+        return protectFormulas
     }
 }
 
@@ -148,6 +186,7 @@ struct ExportDatabaseSheet: View {
     @State private var chosen: Set<String> = []
     @State private var progress: (done: Int, total: Int, name: String)?
     @State private var result: String?
+    @State private var protectFormulas = CSVOptions.protectFormulas
 
     private var tables: [DBObject] { workspace.objects.filter { $0.kind.isRelation && $0.kind != .function } }
 
@@ -158,6 +197,11 @@ struct ExportDatabaseSheet: View {
             Text(kind == .sql ? "CREATE statements and INSERTs for the tables, then the views. For a full backup with sequences, triggers and permissions, use Backup instead."
                  : kind == .xlsx ? "One sheet per table or view." : "One file per table or view, in a folder you choose.")
                 .font(.system(size: 12)).foregroundStyle(MB.dim).fixedSize(horizontal: false, vertical: true)
+            if kind == .csv {
+                Toggle(CSVOptions.title, isOn: $protectFormulas).toggleStyle(.checkbox)
+                    .font(.system(size: 12.5)).foregroundStyle(MB.text).help(CSVOptions.help)
+                    .onChange(of: protectFormulas) { _, v in CSVOptions.protectFormulas = v }
+            }
             HStack {
                 Text("\(chosen.count) of \(tables.count) chosen").font(.system(size: 12)).foregroundStyle(MB.muted)
                 Spacer()
@@ -198,7 +242,7 @@ struct ExportDatabaseSheet: View {
 
     private func start() {
         let objects = tables.filter { chosen.contains($0.id) }
-        let base = (workspace.database ?? workspace.config.displayName).replacingOccurrences(of: "/", with: "-")
+        let base = Export.fileName(workspace.database ?? workspace.config.displayName)
         let url: URL?
         if kind == .csv || kind == .json {
             let panel = NSOpenPanel()
@@ -214,7 +258,7 @@ struct ExportDatabaseSheet: View {
         }
         guard let url else { return }
         progress = (0, objects.count, "")
-        let kind = self.kind
+        let kind = self.kind, protectFormulas = self.protectFormulas
         let report: @Sendable (Int, String) -> Void = { done, name in
             DispatchQueue.main.async { progress = (done, objects.count, name) }
         }
@@ -233,11 +277,16 @@ struct ExportDatabaseSheet: View {
                         }
                         try Export.xlsx(sheets).write(to: url)
                     case .csv, .json:
+                        // A table's name comes from the server. Each file's name is made from it so that it
+                        // can only land in the folder that was chosen ("../x" and "/etc/x" are names here too).
+                        var taken = Set<String>()
                         for (i, o) in objects.enumerated() {
                             report(i, o.name)
+                            let file = try Export.destination(in: url, table: o.name, fileExtension: kind == .csv ? "csv" : "json", taken: &taken)
                             let r = try d.execute("SELECT * FROM \(d.dialect.qualified(o.table))").first(where: \.hasRows) ?? QueryResult()
-                            let text = kind == .csv ? Export.csv(columns: r.columns, rows: r.rows) : Export.json(columns: r.columns, rows: r.rows)
-                            try text.write(to: url.appendingPathComponent("\(o.name).\(kind == .csv ? "csv" : "json")"), atomically: true, encoding: .utf8)
+                            let text = kind == .csv ? Export.csv(columns: r.columns, rows: r.rows, protectFormulas: protectFormulas)
+                                                    : Export.json(columns: r.columns, rows: r.rows)
+                            try text.write(to: file, atomically: true, encoding: .utf8)
                         }
                     }
                 }
@@ -338,7 +387,7 @@ struct BackupSheet: View {
 
     private func backup() {
         let panel = NSSavePanel()
-        let base = (workspace.database ?? workspace.config.displayName).replacingOccurrences(of: "/", with: "-")
+        let base = Export.fileName(workspace.database ?? workspace.config.displayName)
         let ext = kind == .sqlite ? "sqlite" : (kind == .postgres && !plainSQL) ? "dump" : "sql"
         panel.nameFieldStringValue = "\(base)-\(stamp).\(ext)"
         guard panel.runModal() == .OK, let url = panel.url else { return }
@@ -453,7 +502,7 @@ extension Workspace {
                 guard await confirm("Run \(statements.count.formatted()) statement\(statements.count == 1 ? "" : "s") from \(url.lastPathComponent)?",
                                     detail: "\(env)They run one by one against \(database ?? config.displayName), and stop at the first error. What ran before an error stays.",
                                     button: "Run", destructive: config.environment == .production, window: window) else { return }
-                guard await allow(statements.prefix(5).joined(separator: ";\n"), write: statements.contains(where: SQLText.isWrite), alreadyConfirmed: true) else { return }
+                guard await allow(statements.prefix(5).joined(separator: ";\n"), write: statements.contains { SQLText.isWrite($0, kind: self.session.kind) }, alreadyConfirmed: true) else { return }
                 importProgress = (0, statements.count)
                 let report: @Sendable (Int) -> Void = { done in DispatchQueue.main.async { self.importProgress = (done, statements.count) } }
                 do {

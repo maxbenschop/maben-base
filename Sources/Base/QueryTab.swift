@@ -92,12 +92,13 @@ final class QueryTab: ObservableObject, GridSource, Identifiable {
     /// Runs the last statements again, keeping every row.
     func loadAll() {
         guard let sql = lastRun, !running else { return }
-        Task { await execute(sql, limit: .max, confirmed: true) }
+        // Reads were let through when they first ran. Anything else runs a second time here, so it is asked about again.
+        Task { await execute(sql, limit: .max, confirmed: !SQLText.isWrite(sql, kind: workspace.session.kind)) }
     }
 
     private func execute(_ sql: String, limit: Int? = nil, confirmed: Bool = false) async {
         let limit = limit ?? Self.rowLimit
-        if !confirmed { guard await workspace.allow(sql, write: SQLText.isWrite(sql)) else { return } }
+        if !confirmed { guard await workspace.allow(sql, write: SQLText.isWrite(sql, kind: workspace.session.kind)) else { return } }
         lastRun = sql
         running = true
         error = nil
@@ -112,7 +113,8 @@ final class QueryTab: ObservableObject, GridSource, Identifiable {
             let out = try await workspace.session.run { d -> [QueryResult] in
                 var all: [QueryResult] = []
                 for part in parts {
-                    do { all += try d.execute(part, rowLimit: limit) } catch var e as DatabaseError {
+                    // What is run here was typed in the editor, which is the one place a tool's own commands may run from.
+                    do { all += try d.executeTyped(part, rowLimit: limit) } catch var e as DatabaseError {
                         e.completed = all + e.completed
                         if parts.count > 1 { e.message = "Statement \(all.count + 1) of \(parts.count): " + e.message }
                         throw e
@@ -123,7 +125,7 @@ final class QueryTab: ObservableObject, GridSource, Identifiable {
             show(out, ms: Int(Date().timeIntervalSince(start) * 1000))
             workspace.recordHistory(sql, ms: Int(Date().timeIntervalSince(start) * 1000), failed: false)
             // Schema may have changed.
-            if SQLText.isWrite(sql) && sql.range(of: #"\b(create|drop|alter|rename)\b"#, options: [.regularExpression, .caseInsensitive]) != nil {
+            if SQLText.isWrite(sql, kind: workspace.session.kind) && sql.range(of: #"\b(create|drop|alter|rename)\b"#, options: [.regularExpression, .caseInsensitive]) != nil {
                 await workspace.reloadObjects()
             }
         } catch let e as DatabaseError {
@@ -175,9 +177,14 @@ final class QueryTab: ObservableObject, GridSource, Identifiable {
         let statement = SQLText.statements(in: sql).first?.sql ?? sql
         if let p = promptIfNeeded(statement, explain: true), !analyze { prompt = p; return }
         Task {
-            if analyze, SQLText.isWrite(statement) {
-                guard await confirm("Run this statement to measure it?", detail: "Explain with timings runs the statement for real, so its changes happen.\n\n\(statement.prefix(400))",
-                                    button: "Run and explain", window: workspace.window) else { return }
+            if analyze {
+                let write = SQLText.isWrite(statement, kind: workspace.session.kind)
+                if write, workspace.config.safeMode != .readOnly {
+                    guard await confirm("Run this statement to measure it?", detail: "Explain with timings runs the statement for real, so its changes happen.\n\n\(statement.prefix(400))",
+                                        button: "Run and explain", window: workspace.window) else { return }
+                }
+                // It runs for real, so it passes the same gate as running it: a read-only connection refuses a write here too.
+                guard await workspace.allow(statement, write: write, alreadyConfirmed: write) else { return }
             }
             await explainNow(statement, analyze: analyze)
         }
@@ -239,7 +246,7 @@ final class QueryTab: ObservableObject, GridSource, Identifiable {
     }
 
     /// SQLite's EXPLAIN QUERY PLAN rows (id, parent, notused, detail) as an indented tree.
-    nonisolated static func sqlitePlan(_ rows: [[String?]]) -> String {
+    nonisolated static func sqlitePlan(_ rows: [Row]) -> String {
         var children: [String: [(String, String)]] = [:]
         for r in rows where r.count >= 4 { children[r[1] ?? "0", default: []].append((r[0] ?? "", r[3] ?? "")) }
         var out: [String] = []

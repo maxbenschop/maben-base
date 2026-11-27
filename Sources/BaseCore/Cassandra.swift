@@ -11,13 +11,15 @@ public final class CassandraDriver: Driver {
 
     public init(host: String, port: Int, user: String, password: String, keyspace: String, tls: TLSOptions) throws {
         socket = try Socket(host: host, port: port)
-        if tls.mode != .off { socket.startTLS(tls) }
+        // The handshake runs here, and with TLS Verify the certificate is checked here: before the sign-in.
+        if tls.mode != .off { try socket.startTLS(tls) }
         var startup: [UInt8] = []
         startup.appendInt16BE(1)
         startup += Self.string("CQL_VERSION") + Self.string("3.0.0")
         var (op, body) = try request(0x01, startup)
         if op == 0x03 {
-            // PasswordAuthenticator: SASL PLAIN.
+            // PasswordAuthenticator: SASL PLAIN, which is the password itself.
+            guard PlainText.maySendPassword(encrypted: socket.isEncrypted, host: host, mode: tls.mode) else { throw PlainText.passwordRefused(host: host) }
             let token = [0] + Array(user.utf8) + [0] + Array(password.utf8)
             var b: [UInt8] = []
             b.appendInt32BE(Int32(token.count))
@@ -53,12 +55,14 @@ public final class CassandraDriver: Driver {
             let id = h.int16BE()
             let op = h.byte()
             let length = Int(h.int32BE())
+            // The protocol stops a frame at 256 MB.
+            guard length >= 0, length <= 256 << 20 else { throw DatabaseError.malformedReply("A frame of \(length) bytes.") }
             var payload = try socket.read(length)
             // Tracing id, warnings and custom payloads come before the body when their flags are set.
             var r = ByteReader(payload)
             if flags & 0x02 != 0 { _ = r.take(16) }
-            if flags & 0x08 != 0 { let n = Int(r.int16BE()); for _ in 0..<n { _ = readString(&r) } }
-            if flags & 0x04 != 0 { let n = Int(r.int16BE()); for _ in 0..<n { _ = readString(&r); _ = r.take(Int(r.int32BE())) } }
+            if flags & 0x08 != 0 { for _ in 0..<count16(&r) where !r.atEnd { _ = readString(&r) } }
+            if flags & 0x04 != 0 { for _ in 0..<count16(&r) where !r.atEnd { _ = readString(&r); _ = r.take(Int(r.int32BE())) } }
             if r.pos > 0 { payload = Array(payload[r.pos...]) }
             if id == stream { return (op, payload) }  // events (stream -1) are skipped
         }
@@ -92,22 +96,34 @@ public final class CassandraDriver: Driver {
         }
     }
 
-    private func readString(_ r: inout ByteReader) -> String { String(decoding: r.take(Int(UInt16(bitPattern: r.int16BE()))), as: UTF8.self) }
+    private func readString(_ r: inout ByteReader) -> String { String(decoding: r.take(count16(&r)), as: UTF8.self) }
 
-    private func readType(_ r: inout ByteReader) -> CQLType {
+    /// A 16-bit count, never negative.
+    private func count16(_ r: inout ByteReader) -> Int { Int(UInt16(bitPattern: r.int16BE())) }
+
+    /// A 32-bit count of things that each take at least `size` bytes: never negative, and never more than
+    /// the message has room for, so a made-up count can't make the app set aside memory for it.
+    private func count32(_ r: inout ByteReader, each size: Int) -> Int {
+        let n = Int(r.int32BE())
+        return max(0, min(n, r.remaining / max(1, size)))
+    }
+
+    private func readType(_ r: inout ByteReader, depth: Int = 0) throws -> CQLType {
+        // Types nest (list<map<…>>); one nested without end would run the app out of stack.
+        guard depth < 32 else { throw DatabaseError.malformedReply("A column type nested more than 32 deep.") }
         let id = r.int16BE()
         switch id {
         case 0x0000: return .custom(readString(&r))
-        case 0x20: return .list(readType(&r))
-        case 0x22: return .set(readType(&r))
-        case 0x21: let k = readType(&r); return .map(k, readType(&r))
+        case 0x20: return .list(try readType(&r, depth: depth + 1))
+        case 0x22: return .set(try readType(&r, depth: depth + 1))
+        case 0x21: let k = try readType(&r, depth: depth + 1); return .map(k, try readType(&r, depth: depth + 1))
         case 0x30:
             _ = readString(&r); _ = readString(&r)
-            let n = Int(r.int16BE())
-            return .udt((0..<n).map { _ in (readString(&r), readType(&r)) })
+            let n = min(count16(&r), r.remaining / 4)
+            return .udt(try (0..<n).map { _ in (readString(&r), try readType(&r, depth: depth + 1)) })
         case 0x31:
-            let n = Int(r.int16BE())
-            return .tuple((0..<n).map { _ in readType(&r) })
+            let n = min(count16(&r), r.remaining / 2)
+            return .tuple(try (0..<n).map { _ in try readType(&r, depth: depth + 1) })
         default: return .simple(id)
         }
     }
@@ -141,14 +157,15 @@ public final class CassandraDriver: Driver {
                 let scale = Int(r.int32BE())
                 let unscaled = Array(r.rest()).reduce(Int64(Array(r.bytes.dropFirst(4)).first.map { $0 & 0x80 != 0 ? -1 : 0 } ?? 0)) { $0 << 8 | Int64($1) }
                 var s = String(unscaled.magnitude)
-                if scale > 0 {
+                // A scale in the thousands is a broken value, not a number to pad with zeros.
+                if scale > 0, scale <= 10_000 {
                     if s.count <= scale { s = String(repeating: "0", count: scale - s.count + 1) + s }
                     s.insert(".", at: s.index(s.endIndex, offsetBy: -scale))
                 }
                 return (unscaled < 0 ? "-" : "") + s
             case 0x10:
                 if bytes.count == 4 { return bytes.map(String.init).joined(separator: ".") }
-                return stride(from: 0, to: bytes.count, by: 2).map { String(format: "%x", Int(bytes[$0]) << 8 | Int(bytes[$0 + 1])) }.joined(separator: ":")
+                return stride(from: 0, to: bytes.count - 1, by: 2).map { String(format: "%x", Int(bytes[$0]) << 8 | Int(bytes[$0 + 1])) }.joined(separator: ":")
             case 0x11:
                 let days = Int64(UInt32(truncatingIfNeeded: be())) - (1 << 31)
                 return quoteIfNested(String(BSON.isoFormatter.string(from: Date(timeIntervalSince1970: Double(days) * 86400)).prefix(10)))
@@ -159,13 +176,13 @@ public final class CassandraDriver: Driver {
             }
         case .list(let t), .set(let t):
             var r = ByteReader(bytes)
-            let n = Int(r.int32BE())
-            let items = (0..<max(0, n)).map { _ in children(&r).map { value($0, t, nested: true) } ?? "null" }
+            let n = count32(&r, each: 4)
+            let items = (0..<n).map { _ in children(&r).map { value($0, t, nested: true) } ?? "null" }
             return type.name.hasPrefix("set") ? "{" + items.joined(separator: ", ") + "}" : "[" + items.joined(separator: ", ") + "]"
         case .map(let k, let v):
             var r = ByteReader(bytes)
-            let n = Int(r.int32BE())
-            return "{" + (0..<max(0, n)).map { _ in
+            let n = count32(&r, each: 8)
+            return "{" + (0..<n).map { _ in
                 let key = children(&r).map { value($0, k, nested: true) } ?? "null"
                 return "\(key): \(children(&r).map { value($0, v, nested: true) } ?? "null")"
             }.joined(separator: ", ") + "}"
@@ -207,7 +224,7 @@ public final class CassandraDriver: Driver {
         switch kind {
         case 2:
             let flags = r.int32BE()
-            let count = Int(r.int32BE())
+            let count = count32(&r, each: 4)
             var next: [UInt8]?
             if flags & 0x02 != 0 { let n = Int(r.int32BE()); if n >= 0 { next = Array(r.take(n)) } }
             let global = flags & 0x01 != 0
@@ -217,10 +234,10 @@ public final class CassandraDriver: Driver {
                 for _ in 0..<count {
                     if !global { _ = readString(&r); _ = readString(&r) }
                     let name = readString(&r)
-                    cols.append((name, readType(&r)))
+                    cols.append((name, try readType(&r)))
                 }
             }
-            let rowCount = Int(r.int32BE())
+            let rowCount = cols.isEmpty ? 0 : count32(&r, each: 4 * cols.count)
             var rows: [[String?]] = []
             rows.reserveCapacity(rowCount)
             for _ in 0..<rowCount {
@@ -299,7 +316,7 @@ public final class CassandraDriver: Driver {
         let all = try rows("""
             SELECT column_name, type, kind, position FROM system_schema.columns WHERE keyspace_name = \(dialect.literal(ks)) AND table_name = \(dialect.literal(table.name))
             """)
-        func rank(_ r: [String?]) -> (Int, Int) {
+        func rank(_ r: Row) -> (Int, Int) {
             let k = r[2] ?? ""
             return (k == "partition_key" ? 0 : k == "clustering" ? 1 : k == "static" ? 2 : 3, Int(r[3] ?? "") ?? 0)
         }

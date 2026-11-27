@@ -202,12 +202,12 @@ public enum Dump {
         defer { try? handle.close() }
         let d = driver.dialect
         func write(_ s: String) throws { try handle.write(contentsOf: Data(s.utf8)) }
-        try write("-- Maben Base export of \(driver.currentDatabase ?? "database") (\(driver.kind.title) \(driver.serverVersion))\n-- \(ISO8601DateFormatter().string(from: Date()))\n\n")
+        try write("-- \(comment("Maben Base export of \(driver.currentDatabase ?? "database") (\(driver.kind.title) \(driver.serverVersion))"))\n-- \(ISO8601DateFormatter().string(from: Date()))\n\n")
         let tables = objects.filter { $0.kind == .table }
         for (i, object) in tables.enumerated() {
             progress(i, object.name)
             if let create = try driver.definition(of: object) {
-                try write("-- \(object.name)\n\(create.hasSuffix(";") ? create : create + ";")\n\n")
+                try write("-- \(comment(object.name))\n\(create.hasSuffix(";") ? create : create + ";")\n\n")
             }
             let result = try driver.execute("SELECT * FROM \(d.qualified(object.table))").first(where: \.hasRows) ?? QueryResult()
             for chunk in stride(from: 0, to: result.rows.count, by: 1000) {
@@ -220,6 +220,12 @@ public enum Dump {
             if let create = try driver.definition(of: object) { try write("\(create.hasSuffix(";") ? create : create + ";")\n\n") }
         }
         progress(tables.count, "")
+    }
+
+    /// Text for a `--` comment. The database's name, its version and table names come from the server; a
+    /// line break in one would end the comment and put the rest in the file as SQL, to run on restore.
+    static func comment(_ text: String) -> String {
+        String(String.UnicodeScalarView(text.unicodeScalars.map { ConnectionConfig.isControl($0) ? " " : $0 }))
     }
 }
 
@@ -254,25 +260,61 @@ public enum BackupTool {
         public var outputFile: String?
     }
 
+    /// The database as the Postgres tools take it. On its own, a name with an = sign or one that starts with
+    /// postgres:// is read as a whole connection string (another host, another user). Inside dbname='…' it is
+    /// only ever a database name.
+    static func pgDatabase(_ name: String) -> String {
+        "--dbname=dbname='" + name.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "'", with: "\\'") + "'"
+    }
+
+    /// A name that starts with a hyphen would be read as an option by some tool down the line; no database,
+    /// user or host needs one.
+    static func checkNames(database: String, user: String, host: String) throws {
+        for (what, value) in [("database", database), ("user", user), ("host", host)] where value.hasPrefix("-") || ConnectionConfig.hasControl(value) {
+            throw DatabaseError("The \(what) name \(value.prefix(40)) can't be given to the backup tool.", detail: "Names that start with a hyphen, or hold a line break, aren't passed on.")
+        }
+    }
+
+    static func pgDumpArguments(host: String, port: Int, user: String, database: String, file: String, plainSQL: Bool) -> [String] {
+        ["--host=\(host)", "--port=\(port)", "--username=\(user)", pgDatabase(database), "--no-password", "--format=\(plainSQL ? "p" : "c")", "--file=\(file)"]
+    }
+
+    static func psqlArguments(host: String, port: Int, user: String, database: String, file: String) -> [String] {
+        ["--host=\(host)", "--port=\(port)", "--username=\(user)", pgDatabase(database), "--no-password",
+         "--set=ON_ERROR_STOP=1", "--quiet", "--file=\(file)"]
+    }
+
+    static func pgRestoreArguments(host: String, port: Int, user: String, database: String, file: String) -> [String] {
+        ["--host=\(host)", "--port=\(port)", "--username=\(user)", pgDatabase(database), "--no-password", "--no-owner", "--exit-on-error", "--", file]
+    }
+
+    /// The database comes last, after --, so it can only be read as a name.
+    static func mysqlDumpArguments(host: String, port: Int, user: String, database: String, file: String, tls: ConnectionConfig.TLS) -> [String] {
+        ["--host=\(host)", "--port=\(port)", "--user=\(user)", "--protocol=TCP", "--single-transaction",
+         "--routines", "--triggers", "--events", "--hex-blob", "--default-character-set=utf8mb4",
+         "--result-file=\(file)"] + mysqlTLS(tls) + ["--", database]
+    }
+
+    static func mysqlArguments(host: String, port: Int, user: String, database: String, tls: ConnectionConfig.TLS) -> [String] {
+        ["--host=\(host)", "--port=\(port)", "--user=\(user)", "--protocol=TCP", "--default-character-set=utf8mb4"] + mysqlTLS(tls) + ["--", database]
+    }
+
     /// A backup command. Postgres writes its own compressed format (.dump) or plain SQL (.sql); MySQL writes SQL.
     public static func backup(kind: DatabaseKind, host: String, port: Int, user: String, password: String, database: String,
                               tls: ConnectionConfig.TLS, file: String, plainSQL: Bool, serverVersion: String = "") throws -> Command {
         let maria = serverVersion.localizedCaseInsensitiveContains("mariadb")
         switch kind {
         case .postgres:
+            try checkNames(database: database, user: user, host: host)
             guard let exe = find("pg_dump") else { throw missing("pg_dump", brew: "libpq") }
-            return Command(executable: exe,
-                           arguments: ["-h", host, "-p", "\(port)", "-U", user, "-d", database, "--no-password",
-                                       "-F", plainSQL ? "p" : "c", "-f", file],
+            return Command(executable: exe, arguments: pgDumpArguments(host: host, port: port, user: user, database: database, file: file, plainSQL: plainSQL),
                            environment: pgEnvironment(password: password, tls: tls))
         case .mysql:
+            try checkNames(database: database, user: user, host: host)
             // MySQL 9's tools can't sign in to MariaDB (no mysql_native_password), so MariaDB gets its own.
             let exe = maria ? find("mariadb-dump") ?? find("mysqldump") : find("mysqldump") ?? find("mariadb-dump")
             guard let exe else { throw missing("mysqldump", brew: maria ? "mariadb" : "mysql-client") }
-            return Command(executable: exe,
-                           arguments: ["-h", host, "-P", "\(port)", "-u", user, "--protocol=TCP", "--single-transaction",
-                                       "--routines", "--triggers", "--events", "--hex-blob", "--default-character-set=utf8mb4",
-                                       "--result-file=\(file)", database] + mysqlTLS(tls),
+            return Command(executable: exe, arguments: mysqlDumpArguments(host: host, port: port, user: user, database: database, file: file, tls: tls),
                            environment: ["MYSQL_PWD": password])
         default:
             throw DatabaseError("Backups for \(kind.title) are made with its own tools, or with Export Database.")
@@ -284,25 +326,21 @@ public enum BackupTool {
         let maria = serverVersion.localizedCaseInsensitiveContains("mariadb")
         switch kind {
         case .postgres:
+            try checkNames(database: database, user: user, host: host)
             let plain = try isPlainSQL(file)
             if plain {
                 guard let exe = find("psql") else { throw missing("psql", brew: "libpq") }
-                return Command(executable: exe,
-                               arguments: ["-h", host, "-p", "\(port)", "-U", user, "-d", database, "--no-password",
-                                           "-v", "ON_ERROR_STOP=1", "-q", "-f", file],
+                return Command(executable: exe, arguments: psqlArguments(host: host, port: port, user: user, database: database, file: file),
                                environment: pgEnvironment(password: password, tls: tls))
             }
             guard let exe = find("pg_restore") else { throw missing("pg_restore", brew: "libpq") }
-            return Command(executable: exe,
-                           arguments: ["-h", host, "-p", "\(port)", "-U", user, "-d", database, "--no-password",
-                                       "--no-owner", "--exit-on-error", file],
+            return Command(executable: exe, arguments: pgRestoreArguments(host: host, port: port, user: user, database: database, file: file),
                            environment: pgEnvironment(password: password, tls: tls))
         case .mysql:
+            try checkNames(database: database, user: user, host: host)
             let exe = maria ? find("mariadb") ?? find("mysql") : find("mysql") ?? find("mariadb")
             guard let exe else { throw missing("mysql", brew: maria ? "mariadb" : "mysql-client") }
-            return Command(executable: exe,
-                           arguments: ["-h", host, "-P", "\(port)", "-u", user, "--protocol=TCP", "--default-character-set=utf8mb4",
-                                       database] + mysqlTLS(tls),
+            return Command(executable: exe, arguments: mysqlArguments(host: host, port: port, user: user, database: database, tls: tls),
                            environment: ["MYSQL_PWD": password], inputFile: file)
         default:
             throw DatabaseError("Restores for \(kind.title) run with its own tools, or with Import SQL File.")

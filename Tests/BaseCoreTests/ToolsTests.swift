@@ -276,18 +276,19 @@ final class JWTTests: XCTestCase {
 }
 
 final class ReleaseFeedTests: XCTestCase {
-    let sample = #"{"tag_name":"v1.2","draft":false,"prerelease":false,"html_url":"https://github.com/maxbenschop/maben-base/releases/tag/v1.2","body":"- Faster grids","assets":[{"name":"Maben-Base.dmg","browser_download_url":"https://github.com/a.dmg"},{"name":"Maben-Base.zip","browser_download_url":"https://github.com/a.zip"}]}"#
+    let sample = #"{"tag_name":"v1.2","draft":false,"prerelease":false,"html_url":"https://github.com/maxbenschop/maben-base/releases/tag/v1.2","body":"- Faster grids","assets":[{"name":"Maben-Base.dmg","browser_download_url":"https://github.com/a.dmg"},{"name":"Maben-Base.zip","browser_download_url":"https://github.com/maxbenschop/maben-base/releases/download/v1.2/Maben-Base.zip"}]}"#
 
     func testParsesAPublishedRelease() {
         let release = ReleaseFeed.parse(Data(sample.utf8))
         XCTAssertEqual(release?.version, "1.2")
-        XCTAssertEqual(release?.zip.absoluteString, "https://github.com/a.zip")
+        XCTAssertEqual(release?.zip.absoluteString, "https://github.com/maxbenschop/maben-base/releases/download/v1.2/Maben-Base.zip")
         XCTAssertEqual(release?.notes, "- Faster grids")
     }
 
     func testIgnoresDraftsPrereleasesAndReleasesWithoutTheZip() {
         for (a, b) in [(#""draft":false"#, #""draft":true"#), (#""prerelease":false"#, #""prerelease":true"#),
-                       ("Maben-Base.zip", "Other.zip"), ("https://github.com/a.zip", "http://github.com/a.zip")] {
+                       (#""name":"Maben-Base.zip""#, #""name":"Other.zip""#),
+                       ("https://github.com/maxbenschop/maben-base/releases/download", "http://github.com/maxbenschop/maben-base/releases/download")] {
             XCTAssertNil(ReleaseFeed.parse(Data(sample.replacingOccurrences(of: a, with: b).utf8)), b)
         }
         XCTAssertNil(ReleaseFeed.parse(Data("not json".utf8)))

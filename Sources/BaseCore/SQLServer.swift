@@ -34,18 +34,39 @@ public final class SQLServerDriver: Driver {
             let offset = Int(UInt16(bitPattern: r.int16BE())), length = Int(UInt16(bitPattern: r.int16BE()))
             if token == 0x01, length > 0, offset < reply.count { encryption = reply[offset] }
         }
-        switch encryption {
-        case 0x00, 0x01, 0x03 where wantTLS || encryption == 0x03:
-            if !wantTLS { throw DatabaseError("This SQL Server requires encryption.", detail: "Set TLS to Prefer, Require or Verify for this connection.") }
-            let secure = try TDSTLS(socket: plain, host: host, tls: tls.mode == .prefer ? TLSOptions(.require, anchors: tls.anchors, identity: tls.identity) : tls)
+        switch try Self.plan(mode: tls.mode, answer: encryption, host: host) {
+        case .none:
+            break
+        case .session, .loginOnly:
+            // The handshake runs here, and with TLS Verify the certificate is checked here: before the login packet.
+            let secure = try TDSTLS(socket: plain, host: host, tls: tls)
             secure.dropAfterLogin = encryption == 0x00
             socket = secure
-        default:
-            if tls.mode == .require || tls.mode == .verify {
-                throw DatabaseError("This SQL Server doesn't offer encryption.", detail: "Set TLS to Prefer or Off, or use the strict option (TDS 8).")
-            }
         }
         try login(host: host, user: user, password: password, database: database)
+    }
+
+    enum Encryption: Equatable { case none, loginOnly, session }
+
+    /// What to do with the server's answer about encryption (0 off: login only, 1 on, 2 not supported,
+    /// 3 required). Require and Verify insist on the whole session: an answer of "login only" or "not
+    /// supported" would otherwise let someone on the path turn encryption off after the first packet.
+    /// The login packet carries the password, so Prefer goes without TLS only on this Mac or a private network.
+    static func plan(mode: ConnectionConfig.TLS, answer: UInt8, host: String) throws -> Encryption {
+        switch (mode, answer) {
+        case (.off, 0x03):
+            throw DatabaseError("This SQL Server requires encryption.", detail: "Set TLS to Prefer, Require or Verify for this connection.")
+        case (.off, _):
+            return .none
+        case (_, 0x01), (_, 0x03):
+            return .session
+        case (.require, _), (.verify, _):
+            throw DatabaseError("This SQL Server doesn't encrypt the whole connection.",
+                                detail: "TLS \(mode.title) needs every packet encrypted, and the server offered \(answer == 0x00 ? "to encrypt the sign-in only" : "no encryption"). Nothing was sent. Use the strict option (TDS 8), or set TLS to Off if you really want a plain connection.")
+        case (.prefer, _):
+            guard PlainText.mayFallBack(host: host, mode: mode) else { throw PlainText.noTLS(host: host, mode: mode) }
+            return answer == 0x00 ? .loginOnly : .none
+        }
     }
 
     // MARK: Packets
@@ -67,7 +88,7 @@ public final class SQLServerDriver: Driver {
 
     private func send(_ type: UInt8, _ payload: [UInt8]) throws {
         writeLock.lock(); defer { writeLock.unlock() }
-        let max = packetSize - 8
+        let max = Swift.max(504, Swift.min(packetSize, 32767) - 8)
         var offset = 0
         var id: UInt8 = 1
         repeat {
@@ -90,6 +111,7 @@ public final class SQLServerDriver: Driver {
             _ = h.byte()
             let status = h.byte()
             let length = Int(UInt16(bitPattern: h.int16BE()))
+            guard length >= 8, out.count + length <= Socket.maxMessage else { throw DatabaseError.malformedReply("A TDS packet of \(length) bytes.") }
             out += try socket.read(length - 8)
             if status & 0x01 != 0 { return out }
         }
@@ -185,7 +207,7 @@ public final class SQLServerDriver: Driver {
                 var nulls = [Bool](repeating: false, count: columns.count)
                 if token == 0xD2 {
                     let bitmap = Array(r.take((columns.count + 7) / 8))
-                    for i in columns.indices { nulls[i] = bitmap[i / 8] & (1 << (i % 8)) != 0 }
+                    for i in columns.indices where i / 8 < bitmap.count { nulls[i] = bitmap[i / 8] & (1 << (i % 8)) != 0 }
                 }
                 var row: [String?] = []
                 for (i, c) in columns.enumerated() { row.append(nulls[i] ? nil : try value(&r, c)) }
@@ -195,7 +217,7 @@ public final class SQLServerDriver: Driver {
             case 0xFD, 0xFE, 0xFF:  // DONE, DONEPROC, DONEINPROC
                 let status = UInt16(r.intLE(2))
                 _ = r.intLE(2)
-                let count = Int(r.intLE(8))
+                let count = Int(clamping: r.intLE(8))
                 handle?(.done(status: status, count: count))
                 if var c = current {
                     c.message = "\(c.rows.count) row\(c.rows.count == 1 ? "" : "s")"
@@ -222,7 +244,7 @@ public final class SQLServerDriver: Driver {
                 let start = r.pos
                 _ = r.byte(); _ = r.take(4)
                 let name = bVarchar(&r)
-                let v = Array(r.take(4))
+                let v = Array(r.take(4)) + [0, 0, 0, 0]
                 r.pos = start + length
                 handle?(.loginAck("\(name) \(v[0]).\(v[1]).\(Int(v[2]) << 8 | Int(v[3]))"))
             case 0xE3:  // ENVCHANGE
@@ -231,7 +253,7 @@ public final class SQLServerDriver: Driver {
                 let type = r.byte()
                 switch type {
                 case 1: currentDatabase = bVarchar(&r)
-                case 4: packetSize = Int(bVarchar(&r)) ?? packetSize
+                case 4: packetSize = Swift.max(512, Swift.min(Int(bVarchar(&r)) ?? packetSize, 32767))
                 case 8: let n = Int(r.byte()); transaction = Array(r.take(n))
                 case 9, 10: transaction = [UInt8](repeating: 0, count: 8)
                 default: break
@@ -240,7 +262,7 @@ public final class SQLServerDriver: Driver {
             case 0x79: _ = r.take(4)  // RETURNSTATUS
             case 0xA9, 0xA5, 0xA4, 0xED: _ = r.take(Int(r.intLE(2)))  // ORDER, COLINFO, TABNAME, SSPI
             case 0xAE:  // FEATUREEXTACK
-                while true { let id = r.byte(); if id == 0xFF { break }; _ = r.take(Int(r.intLE(4))) }
+                while !r.atEnd { let id = r.byte(); if id == 0xFF { break }; _ = r.take(Int(r.intLE(4))) }
             default:
                 throw DatabaseError("SQL Server sent something this app doesn't read (token 0x\(String(token, radix: 16))).")
             }
@@ -252,9 +274,7 @@ public final class SQLServerDriver: Driver {
 
     private func bVarchar(_ r: inout ByteReader) -> String {
         let n = Int(r.byte())
-        return String(decoding: Array(r.take(n * 2)).withUnsafeBufferPointer { b in
-            Array(UnsafeRawBufferPointer(b).bindMemory(to: UInt16.self)).map { UInt16(littleEndian: $0) }
-        }, as: UTF16.self)
+        return utf16LE(Array(r.take(n * 2)))
     }
 
     private func usVarchar(_ r: inout ByteReader) -> String {
@@ -324,7 +344,7 @@ public final class SQLServerDriver: Driver {
         let total = r.intLE(8)
         if total == 0xFFFF_FFFF_FFFF_FFFF { return nil }
         var out: [UInt8] = []
-        while true {
+        while !r.atEnd {
             let n = Int(r.intLE(4))
             if n == 0 { break }
             out += r.take(n)
@@ -380,7 +400,10 @@ public final class SQLServerDriver: Driver {
         return format(0, bytes, c)
     }
 
-    private func format(_: Int, _ b: [UInt8], _ c: Column) -> String {
+    private func format(_: Int, _ raw: [UInt8], _ c: Column) -> String {
+        // Fixed-size values are read by position. A value shorter than its type says is padded with zeros,
+        // so a broken reply shows a wrong number instead of stopping the app. `raw.count` still tells the sizes apart.
+        let b = raw.count < 17 ? raw + [UInt8](repeating: 0, count: 17 - raw.count) : raw
         func le(_ n: Int) -> Int64 { var v: UInt64 = 0; for i in 0..<min(n, b.count) { v |= UInt64(b[i]) << (8 * UInt64(i)) }; return n >= 8 ? Int64(bitPattern: v) : Int64(v) }
         func signed(_ n: Int) -> Int64 { let v = le(n); let bits = Int64(n * 8); return n >= 8 ? v : (v >= (1 << (bits - 1)) ? v - (1 << bits) : v) }
         func decimalText(_ value: Int64Wide, scale: Int) -> String {
@@ -393,7 +416,7 @@ public final class SQLServerDriver: Driver {
         }
         let iso = { (d: Date, frac: Int, withOffset: Int?) -> String in
             var cal = Calendar(identifier: .gregorian)
-            cal.timeZone = TimeZone(secondsFromGMT: withOffset.map { $0 * 60 } ?? 0)!
+            cal.timeZone = TimeZone(secondsFromGMT: withOffset.map { $0 * 60 } ?? 0) ?? TimeZone(secondsFromGMT: 0)!
             let p = cal.dateComponents([.year, .month, .day, .hour, .minute, .second, .nanosecond], from: d)
             var s = String(format: "%04d-%02d-%02d %02d:%02d:%02d", p.year!, p.month!, p.day!, p.hour!, p.minute!, p.second!)
             if frac > 0 { s += "." + String(String(format: "%09d", p.nanosecond ?? 0).prefix(frac)) }
@@ -412,20 +435,20 @@ public final class SQLServerDriver: Driver {
         switch c.type {
         case 0x30: return String(b[0])
         case 0x32, 0x68: return b.first == 0 ? "0" : "1"
-        case 0x34, 0x38, 0x7F, 0x26: return String(signed(b.count))
+        case 0x34, 0x38, 0x7F, 0x26: return String(signed(raw.count))
         case 0x3B: return String(Float(bitPattern: UInt32(truncatingIfNeeded: le(4))))
         case 0x3E: return String(Double(bitPattern: UInt64(bitPattern: le(8))))
-        case 0x6D: return b.count == 4 ? String(Float(bitPattern: UInt32(truncatingIfNeeded: le(4)))) : String(Double(bitPattern: UInt64(bitPattern: le(8))))
+        case 0x6D: return raw.count == 4 ? String(Float(bitPattern: UInt32(truncatingIfNeeded: le(4)))) : String(Double(bitPattern: UInt64(bitPattern: le(8))))
         case 0x3C, 0x6E, 0x7A:
-            let cents: Int64 = b.count == 4 ? signed(4) : (Int64(Int32(truncatingIfNeeded: le(4))) << 32) | Int64(UInt32(truncatingIfNeeded: Int64(b[4]) | Int64(b[5]) << 8 | Int64(b[6]) << 16 | Int64(b[7]) << 24))
+            let cents: Int64 = raw.count == 4 ? signed(4) : (Int64(Int32(truncatingIfNeeded: le(4))) << 32) | Int64(UInt32(truncatingIfNeeded: Int64(b[4]) | Int64(b[5]) << 8 | Int64(b[6]) << 16 | Int64(b[7]) << 24))
             return decimalText(Int64Wide(cents), scale: 4)
         case 0x6A, 0x6C:
-            var magnitude = [UInt8](b.dropFirst())
+            var magnitude = [UInt8](raw.dropFirst().prefix(16))
             while magnitude.count < 16 { magnitude.append(0) }
             var w = Int64Wide(bytes: magnitude)
             w.negative = b.first == 0
             return decimalText(w, scale: Int(c.scale))
-        case 0x3D, 0x6F where b.count == 8:
+        case 0x3D, 0x6F where raw.count == 8:
             let day = Int32(truncatingIfNeeded: le(4))
             let ticks = UInt32(truncatingIfNeeded: Int64(b[4]) | Int64(b[5]) << 8 | Int64(b[6]) << 16 | Int64(b[7]) << 24)
             return iso(base1900.addingTimeInterval(Double(day) * 86400 + Double(ticks) / 300), 3, nil)
@@ -447,11 +470,11 @@ public final class SQLServerDriver: Driver {
         case 0x24:
             let p = { (r: [Int]) in r.map { String(format: "%02X", b[$0]) }.joined() }
             return "\(p([3, 2, 1, 0]))-\(p([5, 4]))-\(p([7, 6]))-\(p([8, 9]))-\(p([10, 11, 12, 13, 14, 15]))"
-        case 0xE7, 0xEF, 0x63: return utf16LE(b)
+        case 0xE7, 0xEF, 0x63: return utf16LE(raw)
         case 0xA7, 0xAF, 0x23:
-            return String(data: Data(b), encoding: c.utf8 ? .utf8 : .windowsCP1252) ?? String(decoding: b, as: UTF8.self)
+            return String(data: Data(raw), encoding: c.utf8 ? .utf8 : .windowsCP1252) ?? String(decoding: raw, as: UTF8.self)
         default:
-            return "0x" + b.map { String(format: "%02X", $0) }.joined()
+            return "0x" + raw.map { String(format: "%02X", $0) }.joined()
         }
     }
 
@@ -598,7 +621,8 @@ struct Int64Wide {
         words = [UInt32(m & 0xFFFF_FFFF), UInt32(m >> 32), 0, 0]
     }
 
-    init(bytes: [UInt8]) {
+    init(bytes short: [UInt8]) {
+        let bytes = short.count < 16 ? short + [UInt8](repeating: 0, count: 16 - short.count) : short
         var w: [UInt32] = []
         for i in stride(from: 0, to: 16, by: 4) {
             let b0 = UInt32(bytes[i]), b1 = UInt32(bytes[i + 1]) << 8
@@ -629,127 +653,75 @@ struct Int64Wide {
 import Security
 
 /// TLS the TDS 7 way: the handshake travels inside PRELOGIN packets, then TLS records go straight on the wire.
-/// This uses SecureTransport (deprecated, but still in macOS) because it lets us carry the handshake inside
-/// another protocol's packets; Network.framework only runs TLS directly on a socket.
 /// With "login only" encryption (the server said ENCRYPT_OFF), TLS is dropped after the login packet.
 final class TDSTLS: ByteStream, @unchecked Sendable {
     private let socket: Socket
-    private var context: SSLContext!
+    private var session: TLSSession!
     private var handshaking = true
     private var pending: [UInt8] = []  // handshake bytes from the server's PRELOGIN packets
     private var outgoing: [UInt8] = []  // our handshake bytes, sent as one PRELOGIN message per flight
+    private var plainBuffer: [UInt8] = []
+    var dropAfterLogin = false
+    private var active = true
 
     /// Sends what TLS wrote during this handshake flight as one TDS message.
     private func flush() throws {
         guard !outgoing.isEmpty else { return }
+        guard outgoing.count + 8 <= Int(Int16.max) else { throw DatabaseError("The TLS handshake with SQL Server failed.") }
         var p: [UInt8] = [0x12, 0x01]
         p.appendInt16BE(Int16(outgoing.count + 8))
         p += [0, 0, 0, 0]
         try socket.write(p + outgoing)
         outgoing = []
     }
-    private var plainBuffer: [UInt8] = []
-    var dropAfterLogin = false
-    private var active = true
 
+    /// Runs the handshake. With TLS Verify the certificate is checked during it, so the login packet (the
+    /// first thing written through here) never reaches a server that wasn't checked.
     init(socket: Socket, host: String, tls: TLSOptions) throws {
         self.socket = socket
-        guard let ctx = SSLCreateContext(nil, .clientSide, .streamType) else { throw DatabaseError("TLS couldn't start.") }
-        context = ctx
-        SSLSetIOFuncs(ctx, { connection, data, length in
-            let me = Unmanaged<TDSTLS>.fromOpaque(connection).takeUnretainedValue()
-            return me.ioRead(data, length)
-        }, { connection, data, length in
-            let me = Unmanaged<TDSTLS>.fromOpaque(connection).takeUnretainedValue()
-            return me.ioWrite(data, length)
-        })
-        SSLSetConnection(ctx, Unmanaged.passUnretained(self).toOpaque())
-        SSLSetPeerDomainName(ctx, host, host.utf8.count)
-        SSLSetSessionOption(ctx, .breakOnServerAuth, true)
-        if let identity = tls.identity { SSLSetCertificate(ctx, [identity] as CFArray) }
-        var status: OSStatus
-        repeat {
-            status = SSLHandshake(ctx)
-            if status == errSSLPeerAuthCompleted {
-                guard tls.mode == .verify else { continue }
-                var trust: SecTrust?
-                SSLCopyPeerTrust(ctx, &trust)
-                guard let trust else { throw DatabaseError("SQL Server's certificate couldn't be read.") }
-                SecTrustSetPolicies(trust, SecPolicyCreateSSL(true, host as CFString))
-                if !tls.anchors.isEmpty {
-                    SecTrustSetAnchorCertificates(trust, tls.anchors as CFArray)
-                    SecTrustSetAnchorCertificatesOnly(trust, true)
-                }
-                var error: CFError?
-                if !SecTrustEvaluateWithError(trust, &error) {
-                    throw DatabaseError("SQL Server's certificate isn't trusted for \(host).",
-                                        detail: (error.map { ($0 as Error).localizedDescription } ?? "") + "\nUse TLS Require to connect without checking it.")
-                }
-            }
-        } while status == errSSLWouldBlock || status == errSSLPeerAuthCompleted
-        guard status == errSecSuccess else { throw DatabaseError("The TLS handshake with SQL Server failed (\(status)).") }
+        session = try TLSSession(options: tls, peerName: tls.peerName ?? host,
+                                 read: { [unowned self] count in try self.wireRead(count) },
+                                 write: { [unowned self] bytes in try self.wireWrite(bytes) })
+        try session.handshake()
         try flush()
         handshaking = false
     }
 
-    private func ioRead(_ data: UnsafeMutableRawPointer, _ length: UnsafeMutablePointer<Int>) -> OSStatus {
-        let wanted = length.pointee
-        do {
-            if handshaking {
-                // During the handshake, the server's TLS bytes come inside TDS packets.
-                try flush()
-                while pending.count < wanted {
-                    var h = ByteReader(try socket.read(8))
-                    _ = h.byte(); _ = h.byte()
-                    let len = Int(UInt16(bitPattern: h.int16BE()))
-                    pending += try socket.read(len - 8)
-                }
-                pending.prefix(wanted).withUnsafeBufferPointer { data.copyMemory(from: $0.baseAddress!, byteCount: wanted) }
-                pending.removeFirst(wanted)
-            } else {
-                let bytes = try socket.read(wanted)
-                bytes.withUnsafeBufferPointer { data.copyMemory(from: $0.baseAddress!, byteCount: wanted) }
-            }
-            return errSecSuccess
-        } catch {
-            length.pointee = 0
-            return errSSLClosedAbort
+    private func wireRead(_ wanted: Int) throws -> [UInt8] {
+        guard handshaking else { return try socket.read(wanted) }
+        // During the handshake, the server's TLS bytes come inside TDS packets.
+        try flush()
+        while pending.count < wanted {
+            var h = ByteReader(try socket.read(8))
+            _ = h.byte(); _ = h.byte()
+            let length = Int(UInt16(bitPattern: h.int16BE()))
+            guard length >= 8 else { throw DatabaseError.malformedReply("A TDS packet of \(length) bytes.") }
+            pending += try socket.read(length - 8)
         }
+        defer { pending.removeFirst(wanted) }
+        return Array(pending.prefix(wanted))
     }
 
-    private func ioWrite(_ data: UnsafeRawPointer, _ length: UnsafeMutablePointer<Int>) -> OSStatus {
-        let bytes = Array(UnsafeRawBufferPointer(start: data, count: length.pointee))
-        do {
-            if handshaking {
-                outgoing += bytes
-            } else {
-                try socket.write(bytes)
-            }
-            return errSecSuccess
-        } catch {
-            return errSSLClosedAbort
-        }
+    private func wireWrite(_ bytes: [UInt8]) throws {
+        if handshaking { outgoing += bytes } else { try socket.write(bytes) }
     }
 
     func write(_ bytes: [UInt8]) throws {
         guard active else { return try socket.write(bytes) }
-        var written = 0
-        let status = bytes.withUnsafeBytes { SSLWrite(context, $0.baseAddress, bytes.count, &written) }
-        guard status == errSecSuccess else { throw DatabaseError("The connection was lost (TLS \(status)).") }
+        try session.write(bytes)
         // Login-only encryption: everything after the login packet is plain again.
-        if dropAfterLogin && bytes.first == 0x10 { active = false; SSLClose(context) }
+        if dropAfterLogin && bytes.first == 0x10 { active = false; session.close() }
     }
 
     func read(_ count: Int) throws -> [UInt8] {
         guard active else { return try socket.read(count) }
+        guard count >= 0, count <= Socket.maxMessage else { throw DatabaseError.malformedReply("A message of \(count) bytes.") }
         var out = plainBuffer
         plainBuffer = []
         while out.count < count {
             var chunk = [UInt8](repeating: 0, count: max(count - out.count, 16384))
-            var got = 0
-            let status = chunk.withUnsafeMutableBytes { SSLRead(context, $0.baseAddress!, $0.count, &got) }
-            if got > 0 { out += chunk.prefix(got) }
-            if status != errSecSuccess && status != errSSLWouldBlock && got == 0 { throw DatabaseError("The connection was lost (TLS \(status)).") }
+            let got = try chunk.withUnsafeMutableBytes { try session.read(into: $0.baseAddress!, max: $0.count) }
+            out += chunk.prefix(got)
         }
         plainBuffer = Array(out.dropFirst(count))
         return Array(out.prefix(count))
@@ -758,7 +730,7 @@ final class TDSTLS: ByteStream, @unchecked Sendable {
     func readByte() throws -> UInt8 { try read(1)[0] }
 
     func close() {
-        if active { SSLClose(context) }
+        if active { session.close() }
         socket.close()
     }
 }

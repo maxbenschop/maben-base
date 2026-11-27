@@ -9,6 +9,8 @@ final class EngineTests: XCTestCase {
         guard let url = ProcessInfo.processInfo.environment[env] else { throw XCTSkip("\(env) not set") }
         var config = ConnectionConfig()
         let parsed = config.apply(url: url)
+        // A URL never names a program to run; the path to sqlplus or duckdb has its own variable (MB_TEST_ORACLE_TOOL).
+        if let tool = ProcessInfo.processInfo.environment[env + "_TOOL"] { config.localToolPath = tool }
         return try Connector.open(config, password: parsed.password)
     }
 
@@ -23,7 +25,8 @@ final class EngineTests: XCTestCase {
     }
 
     private func save(_ db: Driver, _ changes: ChangeSet, _ table: TableRef, _ result: QueryResult, key: [String]) throws {
-        for s in try db.dialect.statements(for: changes, table: table, columns: result.columns, primaryKey: key) { _ = try db.execute(s) }
+        // As the app does: the driver writes the edits (Redis and MongoDB from the values, never from text).
+        try db.apply(changes, table: table, columns: result.columns, primaryKey: key)
     }
 
     func testRedis() throws {

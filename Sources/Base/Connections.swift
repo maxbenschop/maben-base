@@ -11,6 +11,11 @@ final class ConnectionList: ObservableObject {
     @Published var password = ""
     @Published var sshSecret = ""
     @Published var certificatePassword = ""
+    /// Secrets that are saved for the selected connection but for another server: shown as a note, not used.
+    @Published var withheld: Set<SecretSlot> = []
+    /// A new connection's TLS mode follows its host (Verify for a server out on the internet, Prefer nearby)
+    /// until you choose one yourself. A saved connection keeps the mode it has.
+    var tlsChosen = true
     var secrets: Secrets { Secrets(password: password, ssh: sshSecret, certificate: certificatePassword) }
     @Published var filter = ""
     @Published var busy: String?
@@ -22,6 +27,8 @@ final class ConnectionList: ObservableObject {
     init(store: Store, persist: Bool = true, initial: [ConnectionConfig]? = nil) {
         self.store = store
         self.persist = persist
+        // Passwords saved by an older version get tied to the server they are for, before anything reads them.
+        if persist { store.adoptSavedPasswords() }
         connections = initial ?? store.connections()
         if let first = connections.first { select(first.id) }
     }
@@ -31,10 +38,12 @@ final class ConnectionList: ObservableObject {
         testResult = nil
         if let id, let c = connections.first(where: { $0.id == id }) {
             draft = c
-            let s = persist ? Secrets.load(c.id) : Secrets()
+            tlsChosen = true
+            let s = persist ? Secrets.load(c) : Secrets()
             password = s.password ?? ""
             sshSecret = s.ssh ?? ""
             certificatePassword = s.certificate ?? ""
+            withheld = s.withheld
         }
     }
 
@@ -43,16 +52,23 @@ final class ConnectionList: ObservableObject {
         c.kind = kind
         c.port = kind.defaultPort
         c.user = kind == .postgres ? NSUserName() : kind == .mysql ? "root" : ""
-        c.tls = kind == .sqlite ? .off : .prefer
+        c.tls = ConnectionConfig.defaultTLS(kind: kind, host: c.host)
         draft = c
+        tlsChosen = false
         password = ""
         sshSecret = ""
         certificatePassword = ""
+        withheld = []
         selected = nil
         testResult = nil
     }
 
     var isNew: Bool { !connections.contains { $0.id == draft.id } }
+
+    /// Call when the host or the engine of the draft changed.
+    func followHostWithTLS() {
+        if isNew && !tlsChosen { draft.tls = ConnectionConfig.defaultTLS(kind: draft.kind, host: draft.host) }
+    }
 
     var grouped: [(group: String, items: [ConnectionConfig])] {
         let f = filter.lowercased()
@@ -63,11 +79,15 @@ final class ConnectionList: ObservableObject {
     }
 
     func save() {
+        // A pasted value can carry a line break or another control character; no field needs one.
+        draft.stripControlCharacters()
         if draft.name.trimmingCharacters(in: .whitespaces).isEmpty { draft.name = draft.displayName }
         if connections.first(where: { $0.id == draft.id }) != draft { draft.modified = Date() }
         if let i = connections.firstIndex(where: { $0.id == draft.id }) { connections[i] = draft } else { connections.append(draft) }
         selected = draft.id
-        if persist { secrets.save(draft.id) }
+        // Saved for what the connection points at now: this is the one place a password moves to a new host.
+        if persist { secrets.save(draft) }
+        withheld = []
         persistAll()
     }
 
@@ -85,12 +105,12 @@ final class ConnectionList: ObservableObject {
 
     func duplicate(_ id: UUID) {
         guard var c = connections.first(where: { $0.id == id }) else { return }
-        let s = persist ? Secrets.load(id) : Secrets()
+        let s = persist ? Secrets.load(c) : Secrets()
         c.id = UUID()
         c.name += " copy"
         c.modified = Date()
         connections.append(c)
-        if persist { s.save(c.id) }
+        if persist { s.save(c) }
         persistAll()
         select(c.id)
     }
@@ -325,7 +345,7 @@ struct ConnectionEditor: View {
                         }
                         row(list.draft.kind == .libsql ? "URL" : "Host") {
                             HStack(spacing: 8) {
-                                MBField(placeholder: hostPlaceholder, text: $list.draft.host, mono: true)
+                                MBField(placeholder: hostPlaceholder, text: hostBinding, mono: true)
                                 Text("Port").font(.system(size: 12)).foregroundStyle(MB.dim)
                                 MBField(placeholder: "\(list.draft.kind.defaultPort)", text: portBinding, mono: true).frame(width: 80)
                             }
@@ -337,6 +357,7 @@ struct ConnectionEditor: View {
                             MBField(placeholder: list.draft.kind == .libsql ? "Auth token (empty for a local sqld); stored in your Keychain" : "Stored in your Keychain",
                                     text: $list.password, secure: true)
                         }
+                        withheldNote(.password)
                         if list.draft.kind != .libsql {
                             row(databaseLabel) { MBField(placeholder: databasePlaceholder, text: $list.draft.database, mono: true) }
                         }
@@ -355,9 +376,11 @@ struct ConnectionEditor: View {
                             }
                         }
                         row("TLS") {
-                            HStack(spacing: 10) {
-                                MBSegmented(options: ConnectionConfig.TLS.allCases, selection: $list.draft.tls) { $0.title }
-                                Text(tlsHelp).font(.system(size: 11.5)).foregroundStyle(MB.dim)
+                            VStack(alignment: .leading, spacing: 6) {
+                                MBSegmented(options: ConnectionConfig.TLS.allCases, selection: tlsBinding) { $0.title }
+                                Text(list.draft.tls.help(for: list.draft.kind)).font(.system(size: 11.5))
+                                    .foregroundStyle(list.draft.tls == .off && !HostScope.isLocal(list.draft.host) ? MB.orange : MB.dim)
+                                    .fixedSize(horizontal: false, vertical: true)
                             }
                         }
                         if list.draft.tls != .off {
@@ -375,6 +398,7 @@ struct ConnectionEditor: View {
                             }
                             if !list.draft.clientCertFile.isEmpty {
                                 row(".p12 password") { MBField(placeholder: "Stored in your Keychain", text: $list.certificatePassword, secure: true) }
+                                withheldNote(.certificate)
                             }
                         }
                         Hairline()
@@ -405,6 +429,7 @@ struct ConnectionEditor: View {
                                 }
                                 row("Passphrase") { MBField(placeholder: "Only if the key has one; stored in your Keychain", text: $list.sshSecret, secure: true) }
                             }
+                            withheldNote(.ssh)
                             row("") {
                                 Text("Host and port above are as seen from the SSH server, often 127.0.0.1. Your ~/.ssh/config, agent and known hosts are used as in Terminal.")
                                     .font(.system(size: 11.5)).foregroundStyle(MB.dim).fixedSize(horizontal: false, vertical: true)
@@ -493,10 +518,11 @@ struct ConnectionEditor: View {
         row("Tool") {
             VStack(alignment: .leading, spacing: 4) {
                 MBField(placeholder: ToolFinder.find(name, configured: nil).map { "Found: \(($0 as NSString).abbreviatingWithTildeInPath)" } ?? "Path to \(name)",
-                        text: option("tool"), mono: true)
-                Text(ToolFinder.find(name, configured: list.draft.options["tool"]) == nil ? "\(name) isn't installed. Install \(install)." :
-                        "Maben Base runs your \(name) to talk to the database.")
-                    .font(.system(size: 11.5)).foregroundStyle(ToolFinder.find(name, configured: list.draft.options["tool"]) == nil ? MB.orange : MB.dim)
+                        text: $list.draft.localToolPath, mono: true)
+                Text(ToolFinder.find(name, configured: list.draft.localToolPath) == nil ? "\(name) isn't installed. Install \(install)." :
+                        "Maben Base runs your \(name) to talk to the database. This path stays on this Mac: it isn't synced or exported.")
+                    .font(.system(size: 11.5)).foregroundStyle(ToolFinder.find(name, configured: list.draft.localToolPath) == nil ? MB.orange : MB.dim)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
@@ -520,6 +546,7 @@ struct ConnectionEditor: View {
             row("Account") { MBField(placeholder: "orgname-accountname, or xy12345.eu-west-1", text: $list.draft.host, mono: true) }
             row("User") { MBField(placeholder: "user", text: $list.draft.user, mono: true) }
             row("Token") { MBField(placeholder: "Programmatic access token; stored in your Keychain", text: $list.password, secure: true) }
+            withheldNote(.password)
             row("Key file") {
                 HStack(spacing: 8) {
                     MBField(placeholder: "Or: key-pair sign-in with an unencrypted .p8 key", text: $list.draft.filePath, mono: true)
@@ -533,6 +560,7 @@ struct ConnectionEditor: View {
             row("Account ID") { MBField(placeholder: "Cloudflare account ID", text: $list.draft.host, mono: true) }
             row("Database ID") { MBField(placeholder: "The D1 database's UUID", text: $list.draft.database, mono: true) }
             row("API token") { MBField(placeholder: "A token with D1 edit permission; stored in your Keychain", text: $list.password, secure: true) }
+            withheldNote(.password)
         }
     }
 
@@ -557,13 +585,23 @@ struct ConnectionEditor: View {
         }
     }
 
-    private var tlsHelp: String {
-        switch list.draft.tls {
-        case .off: "Plain connection"
-        case .prefer: "TLS when the server offers it"
-        case .require: "TLS, any certificate"
-        case .verify: "TLS, valid certificate"
+    /// Shown under a secret's field when one is saved for this connection but for another server or user
+    /// (the connection changed in a file or through sync): it isn't used until it is typed again here.
+    @ViewBuilder private func withheldNote(_ slot: SecretSlot) -> some View {
+        if list.withheld.contains(slot) {
+            row("") {
+                Text("The one saved on this Mac is for a different server or user, so it isn't used. Type it again to save it for this one.")
+                    .font(.system(size: 11.5)).foregroundStyle(MB.orange).fixedSize(horizontal: false, vertical: true)
+            }
         }
+    }
+
+    private var hostBinding: Binding<String> {
+        Binding(get: { list.draft.host }, set: { list.draft.host = $0; list.followHostWithTLS() })
+    }
+
+    private var tlsBinding: Binding<ConnectionConfig.TLS> {
+        Binding(get: { list.draft.tls }, set: { list.draft.tls = $0; list.tlsChosen = true })
     }
 
     private func row<C: View>(_ label: String, @ViewBuilder _ content: () -> C) -> some View {
@@ -577,6 +615,7 @@ struct ConnectionEditor: View {
         Binding(get: { list.draft.kind }, set: { k in
             if list.draft.port == list.draft.kind.defaultPort || list.draft.port == 0 { list.draft.port = k.defaultPort }
             list.draft.kind = k
+            list.followHostWithTLS()
         })
     }
 
@@ -597,6 +636,8 @@ struct ConnectionEditor: View {
             return
         }
         list.draft = c
+        // The URL said how to connect, or left it to the host: either way the mode is set now.
+        list.tlsChosen = true
         if let pw = r.password { list.password = pw }
         url = ""
         list.testResult = nil

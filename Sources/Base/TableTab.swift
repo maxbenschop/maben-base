@@ -333,7 +333,10 @@ final class TableTab: ObservableObject, GridSource, Identifiable {
         loading = true
         do {
             // One transaction where the engine has them; an UPDATE or DELETE that matches nothing stops it.
-            try await workspace.session.run { d in try d.runAsUnit(statements, checkFound: true) }
+            // The driver writes the edits from the values themselves (`statements` is what is shown and kept in
+            // the history), so a value is never read back as command text.
+            let changes = changes, table = object.table, columns = columns, primaryKey = primaryKey
+            try await workspace.session.run { d in try d.apply(changes, table: table, columns: columns, primaryKey: primaryKey) }
             workspace.recordHistory(statements.joined(separator: ";\n") + ";", ms: nil, failed: false)
             await load()
         } catch {

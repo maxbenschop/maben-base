@@ -179,8 +179,7 @@ private struct ReleaseNotes: View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Maben Base \(release.version)").font(.system(size: 13, weight: .semibold))
             ScrollView {
-                Text((try? AttributedString(markdown: release.notes, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)))
-                     ?? AttributedString(release.notes))
+                Text(ReleaseFeed.notesText(release.notes))
                     .font(.system(size: 12))
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -272,7 +271,7 @@ enum SessionMemory {
             opened = true
             Task {
                 do {
-                    let session = try await Session.open(config, secrets: Secrets.load(config.id))
+                    let session = try await Session.open(config, secrets: Secrets.load(config))
                     let controller = WorkspaceWindowController(session: session, store: store, restoring: item)
                     controller.show()
                 } catch {
@@ -307,7 +306,7 @@ struct ConnectionFile: Codable {
         if let passphrase, !passphrase.isEmpty {
             var map: [String: SecretSet] = [:]
             for c in connections {
-                let s = Secrets.load(c.id)
+                let s = Secrets.load(c)
                 map[c.id.uuidString] = SecretSet(password: s.password, ssh: s.ssh, certificate: s.certificate)
             }
             file.secrets = try SecretBox.seal(try JSONEncoder().encode(map), passphrase: passphrase)
@@ -396,18 +395,25 @@ extension ConnectionList {
                     do { secrets = try file.openSecrets(pass); break } catch { NSSound.beep() }
                 }
             }
-            for var c in file.connections {
+            // A connection with a line break or another control character in a field is left out.
+            let usable = file.connections.filter(\.isWellFormed)
+            for var c in usable {
                 if let i = connections.firstIndex(where: { $0.id == c.id }) {
+                    // The tool's path is this Mac's own setting; a file never brings one.
+                    c.localToolPath = connections[i].localToolPath
                     connections[i] = c
                 } else {
                     if c.modified == Date(timeIntervalSince1970: 0) { c.modified = Date() }
                     connections.append(c)
                 }
-                if persist, let s = secrets[c.id] { s.save(c.id) }
+                // Passwords that came in the file are for the connection as the file has it. One saved here
+                // earlier under the same ID stays tied to the server it was saved for, and isn't used for another.
+                if persist, let s = secrets[c.id] { s.save(c) }
             }
             persistAll()
-            if let first = file.connections.first { select(first.id) }
-            testResult = (true, "Imported \(file.connections.count) connection\(file.connections.count == 1 ? "" : "s")\(secrets.isEmpty ? "" : " with passwords").")
+            if let first = usable.first { select(first.id) }
+            let skipped = file.connections.count - usable.count
+            testResult = (true, "Imported \(usable.count) connection\(usable.count == 1 ? "" : "s")\(secrets.isEmpty ? "" : " with passwords")\(skipped > 0 ? "; \(skipped) left out (settings with characters that can't be used)" : "").")
         } catch {
             showError(error, in: nil, title: "Import failed")
         }
@@ -424,7 +430,7 @@ extension ConnectionList {
             guard r.ok else { continue }
             c.modified = Date()
             connections.append(c)
-            if persist { Secrets(password: r.password).save(c.id) }
+            if persist { Secrets(password: r.password).save(c) }
             added += 1
         }
         persistAll()
